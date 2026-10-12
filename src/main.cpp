@@ -20,13 +20,16 @@
 // GPIO10 / ADC1_CH9. A0 and A4 sit on ADC2, which stops working once WiFi runs.
 #define AUDIO_PIN A3
 
-#define FFT_N 64        // 32 bins, one per column
-#define SAMPLE_HZ 9000  // ~4.5 kHz span, matching the old AVR analogRead pacing
-#define BIN_WIDTH 2     // columns sharing one band, as the sketch booted on AVR
+#define FFT_N 256        // 128 bins of ~47 Hz
+#define SAMPLE_HZ 12000  // 6 kHz span; analogRead takes ~75 us, so ~13 kHz is the ceiling
+#define BIN_WIDTH 2      // columns sharing one band, as the sketch booted on AVR
+#define BANDS (LED_COLS / BIN_WIDTH)
+#define BAND_LOW_HZ 60   // bands are spaced logarithmically from here up to SAMPLE_HZ / 2
 
 #define PEAK_FALLOFF_MS 500  // how long a peak marker hangs before sinking
-#define SILENCE_FLOOR 0.16f  // noise sits below this; raise if idle bars twitch
-#define MM_SIZE 32
+#define NOISE_FLOOR_DB -28   // per-bin noise level; raise if bars twitch with the needle up
+#define DISPLAY_DB 30        // range the bars show, from the recent loudest band down
+#define MM_SIZE 32           // frames averaged for the scale and silence detection
 #define ATTACK_MS 25    // how fast bars rise to a new level
 #define RELEASE_MS 140  // how slowly they sink back; raise for calmer bars
 
@@ -41,7 +44,10 @@ Adafruit_Protomatter matrix(LED_COLS, 6, 1, rgbPins, 3, addrPins,
 float vReal[FFT_N], vImag[FFT_N];
 ArduinoFFT<float> FFT(vReal, vImag, FFT_N, (float)SAMPLE_HZ);
 
-float spectrum[FFT_N / 2];
+float bands[BANDS];
+uint8_t bandEdge[BANDS + 1];  // first FFT bin of each band, plus the end of the last
+float bandNoise[BANDS];       // NOISE_FLOOR_DB raised by the band's width: noise adds up per bin
+uint32_t sampleMicros;        // how long the last FFT_N samples took, to check SAMPLE_HZ is met
 uint8_t peaks[LED_COLS];
 uint32_t peakMillis[LED_COLS];
 float barLevel[LED_COLS];
@@ -49,28 +55,31 @@ uint32_t lastDraw = 0;
 
 uint16_t colorOff, colorPeak, colorRow[LED_ROWS];
 
-// full-scale reference for the log amplitude scale, as in the original sketch
-const float normAmp = logf(32768.0f);
-float avgAmpNorm = 0.0f;
+struct MovingAverage
+{
+    float values[MM_SIZE] = {};
+    float sum = 0.0f;
+    int index = 0, count = 0;
 
-float mmValues[MM_SIZE];
-float mmSum = 0.0f;
-int mmIndex = 0, mmCount = 0;
+    float add(float val)
+    {
+        sum += val - values[index];
+        values[index] = val;
+        index = (index + 1) % MM_SIZE;
+        count = min(count + 1, MM_SIZE);
+        return sum / count;
+    }
+};
+
+MovingAverage peakAvg, signalAvg;
+float peakDb;    // recent loudest band, the top of the bar scale
+float signalDb;  // recent loudest band relative to its noise floor; > 0 means audio
 
 // RGB565 gives green one bit more than red and blue, so dark grays would light
 // only the green LED. Quantizing all three to 5 bits keeps darks neutral.
 static uint16_t rgb(uint8_t r, uint8_t g, uint8_t b)
 {
     return (r >> 3 << 11) | (g >> 3 << 6) | (b >> 3);
-}
-
-static float addValue(float val)
-{
-    mmSum = mmSum - mmValues[mmIndex] + val;
-    mmValues[mmIndex] = val;
-    mmIndex = (mmIndex + 1) % MM_SIZE;
-    mmCount = min(mmCount + 1, MM_SIZE);
-    return mmSum / (float)mmCount;
 }
 
 static void resetPeaks()
@@ -94,7 +103,7 @@ static void resetPeaks()
 static void sampleAudio()
 {
     const uint32_t period = 1000000UL / SAMPLE_HZ;
-    uint32_t next = micros();
+    uint32_t start = micros(), next = start;
     int32_t sum = 0;
 
     for (int i = 0; i < FFT_N; i++)
@@ -107,6 +116,7 @@ static void sampleAudio()
         vImag[i] = 0.0f;
         sum += raw;
     }
+    sampleMicros = micros() - start;
 
     // subtract the measured bias rather than trusting the divider to sit at mid-rail
     float mean = (float)sum / FFT_N;
@@ -119,38 +129,33 @@ static void runFFT()
     FFT.compute(FFTDirection::Forward);
     FFT.complexToMagnitude();
 
-    float maxAmpNorm = 0.0f;
+    float maxDb = -1e9f, maxSignal = -1e9f;
 
-    for (int i = 0; i < FFT_N / 2; i++)
+    for (int b = 0; b < BANDS; b++)
     {
-        spectrum[i] = 0.0f;
-
-        // fix_fft scaled its output down by N; match that so normAmp still fits
-        float mag = vReal[i] / FFT_N;
-        float amp = mag * mag;
-
-        if (amp > 1.0f)
+        // summing power over the band means wide treble bands collect as much as narrow
+        // bass ones, which offsets music's falling energy toward the top
+        float power = 0.0f;
+        for (int i = bandEdge[b]; i < bandEdge[b + 1]; i++)
         {
-            float ampNorm = logf(amp) / normAmp;
-            maxAmpNorm = max(maxAmpNorm, ampNorm);
-            spectrum[i] = ampNorm;
+            float mag = vReal[i] / FFT_N;
+            power += mag * mag;
         }
+
+        bands[b] = 10.0f * log10f(max(power, 1e-12f));
+        maxDb = max(maxDb, bands[b]);
+        maxSignal = max(maxSignal, bands[b] - bandNoise[b]);
     }
 
-    avgAmpNorm = addValue(maxAmpNorm);
+    peakDb = peakAvg.add(maxDb);
+    signalDb = signalAvg.add(maxSignal);
 }
 
 static void draw()
 {
-    for (int i = 0; i < LED_COLS / BIN_WIDTH; i++)
-    {
-        float maxVal = 0.0f;
-        for (int j = 0; j < BIN_WIDTH; j++)
-            maxVal = max(maxVal, spectrum[i * BIN_WIDTH + j]);
-        for (int j = 0; j < BIN_WIDTH; j++) spectrum[i * BIN_WIDTH + j] = maxVal;
-    }
-
-    float scale = avgAmpNorm < SILENCE_FLOOR ? 0.0f : 1.0f / avgAmpNorm * LED_ROWS;
+    // Bars span DISPLAY_DB below the recent loudest band, but never reach into a band's
+    // noise: quiet passages show whatever rises above it, silence shows nothing.
+    const float scale = (float)LED_ROWS / DISPLAY_DB;
 
     // time-based so the feel doesn't depend on how fast loop() runs
     uint32_t now = millis();
@@ -163,7 +168,9 @@ static void draw()
 
     for (int i = 0; i < LED_COLS; i++)
     {
-        float target = min(spectrum[i] * scale, (float)LED_ROWS);
+        int b = i / BIN_WIDTH;
+        float bottom = max(peakDb - DISPLAY_DB, bandNoise[b]);
+        float target = constrain((bands[b] - bottom) * scale, 0.0f, (float)LED_ROWS);
         barLevel[i] += (target - barLevel[i]) * (target > barLevel[i] ? attack : release);
         int val = (int)lroundf(barLevel[i]);
 
@@ -326,7 +333,7 @@ static bool updateNowPlaying()
     receiveNowPlaying();
     if (np.active && millis() - np.lastPacket > NP_TIMEOUT_MS) np.active = false;
 
-    if (avgAmpNorm >= SILENCE_FLOOR) lastVinyl = millis();
+    if (signalDb > 0.0f) lastVinyl = millis();
     if (!np.active || millis() - lastVinyl <= VINYL_HOLD_MS) return false;
 
     drawNowPlaying();
@@ -360,11 +367,22 @@ void setup()
     }
     colorPeak = rgb(lilac[0], lilac[1], lilac[2]);
 
+    // Log-spaced band edges. The FFT is too coarse to split the bass logarithmically,
+    // so each band takes at least one bin of its own: linear up to ~400 Hz, log above.
+    const float binHz = (float)SAMPLE_HZ / FFT_N, highHz = SAMPLE_HZ / 2.0f;
+    for (int b = 0; b <= BANDS; b++)
+    {
+        int bin = lroundf(BAND_LOW_HZ * powf(highHz / BAND_LOW_HZ, (float)b / BANDS) / binHz);
+        if (b > 0) bin = max(bin, bandEdge[b - 1] + 1);
+        bandEdge[b] = min(bin, FFT_N / 2);
+    }
+    for (int b = 0; b < BANDS; b++)
+        bandNoise[b] = NOISE_FLOOR_DB + 10.0f * log10f(bandEdge[b + 1] - bandEdge[b]);
+
 #ifdef NOW_PLAYING
     beginNowPlaying();
 #endif
 
-    memset(mmValues, 0, sizeof(mmValues));
     resetPeaks();
 }
 
@@ -372,6 +390,16 @@ void loop()
 {
     sampleAudio();
     runFFT();
+
+    // for tuning NOISE_FLOOR_DB: with the needle up, "above noise" should stay a few dB
+    // below 0; add it to NOISE_FLOOR_DB if it doesn't
+    static uint32_t lastPrint = 0;
+    if (millis() - lastPrint > 1000)
+    {
+        lastPrint = millis();
+        Serial.printf("above noise %+.1f dB, peak %.1f dB, sampling at %lu Hz\n", signalDb, peakDb,
+                      1000000UL * FFT_N / sampleMicros);
+    }
 
 #ifdef NOW_PLAYING
     if (updateNowPlaying()) return;

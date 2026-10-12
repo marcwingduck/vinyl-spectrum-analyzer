@@ -1,6 +1,6 @@
 # Vinyl Spectrum Analyzer: LED Rulez D00d
 
-A 32×16 LED spectrum analyzer that listens to the record player. Line-level audio is tapped after the phono preamp and run through an FFT on an Adafruit MatrixPortal S3, and the result is drawn as 32 bars on a HUB75 panel. The bars fade from sage to lilac, with peak dots that hang and sink.
+A 32×16 LED spectrum analyzer that listens to the record player. Line-level audio is tapped after the phono preamp and run through an FFT on an Adafruit MatrixPortal S3, and the result is drawn as 16 bars on a HUB75 panel, spaced like a real analyzer: one bar per 47 Hz in the bass, widening logarithmically up to 6 kHz. The bars fade from sage to lilac, with peak dots that hang and sink.
 
 It's a port of my earlier Arduino Uno build, [VisEQ](https://github.com/marcwingduck/viseq), which used a microphone.
 
@@ -88,7 +88,7 @@ Only built when `src/secrets.h` exists, see [Build and flash](#build-and-flash).
 
 The board joins WiFi as `vinyl-matrix.local` and listens on UDP port 4210. snapserver-lcd sends one datagram per change and repeats it every 10 s. If nothing arrives for 30 s, or a stop packet comes in, the panel returns to the spectrum. If the board never connects, the spectrum runs as before.
 
-Vinyl always wins. The ADC only hears the turntable, so any signal above `SILENCE_FLOOR` switches to the spectrum straight away. The panel goes back to Spotify only after `VINYL_HOLD_MS` of silence.
+Vinyl always wins. The ADC only hears the turntable, so any band above its noise floor switches to the spectrum straight away. The panel goes back to Spotify only after `VINYL_HOLD_MS` of silence.
 
 Datagram layout (version 4). Everything after byte 3 is only sent with `P`:
 
@@ -110,14 +110,16 @@ All settings are `#define`s at the top of [src/main.cpp](src/main.cpp).
 | `ATTACK_MS` | 25 | How fast bars rise. Lower it for punchier beats |
 | `RELEASE_MS` | 140 | How slowly bars sink. Raise it for calmer bars |
 | `PEAK_FALLOFF_MS` | 500 | How long a peak dot hangs before sinking |
-| `SILENCE_FLOOR` | 0.16 | Below this level the bars stay dark. Raise it if bars twitch during silence, or if WiFi noise keeps the panel from switching to Spotify |
+| `NOISE_FLOOR_DB` | -28 | Per-bin noise level. Each bar only shows what rises above it, so silence stays dark and quiet passages still show. See below |
+| `DISPLAY_DB` | 30 | Range the bars cover below the recent loudest band. Lower it for livelier bars |
+| `SAMPLE_HZ` | 12000 | `analogRead()` takes ~75 µs, so ~13 kHz is the ceiling. The serial monitor shows the rate actually reached |
 | `ART_GAMMA` | 2.2 | Gamma correction for the artwork. Lower it if dark covers lose detail |
 | `SCROLL_PX_PER_S` | 15 | Marquee speed of artist and title |
 | `VINYL_HOLD_MS` | 3000 | Silence needed before Spotify takes the panel back |
 
 The colors are the `sage` and `lilac` RGB values in `setup()`. Everything runs at full brightness: dimming in software costs color depth (dark tones flicker and posterize), so tame the panel with a tinted film or smoked acrylic in front instead.
 
-**Input gain:** the samples are divided by `8.0f` in `sampleAudio()`. If the bars drop out in quiet passages, lower it. If they're at full height most of the time, raise it, or turn down the preamp output.
+**Calibrating the noise floor:** run `pio device monitor`. Once a second the board prints how far the loudest band is above its noise floor. With the needle up it should stay a few dB below 0. If it reaches 0, raise `NOISE_FLOOR_DB` by that much plus ~3 dB, since the bars and the Spotify handover would otherwise react to noise. If it sits far below, lower the floor so quiet passages show more.
 
 ## License
 
