@@ -208,18 +208,25 @@ static void draw()
 #define TEXT_X (ART_SIZE + 1)       // one blank column between artwork and text
 #define TITLE_BASELINE 15           // 3x5 font: caps on rows 10-14, descenders on the bottom row
 #define ARTIST_BASELINE 9           // one font line (6 px) above: caps on rows 4-8
+#define SLIDE_MS 500                // a new song pushes the old one down and out
 
 U8G2_FOR_ADAFRUIT_GFX text;
+
+struct Track
+{
+    uint32_t textSince;  // marquee start
+    uint16_t art[ART_SIZE * ART_SIZE];
+    uint16_t colorArtist;
+    char artist[TEXT_MAX], title[TEXT_MAX];
+    int artistWidth, titleWidth;  // in px
+};
 
 struct NowPlaying
 {
     bool active = false;
     uint32_t lastPacket = 0;
-    uint32_t textSince = 0;  // marquee start, reset when the text changes
-    uint16_t art[ART_SIZE * ART_SIZE];
-    uint16_t colorArtist;
-    char artist[TEXT_MAX], title[TEXT_MAX];
-    int artistWidth, titleWidth;  // in px
+    uint32_t slideSince = 0;
+    Track track, previous;  // previous is only drawn while it slides out
 } np;
 
 WiFiUDP udp;
@@ -247,30 +254,35 @@ static void receiveNowPlaying()
     }
     if (packet[3] != 'P' || len < 4 + artBytes + 3 + 2) return;
 
-    const uint8_t *p = packet + 4;
-    for (int i = 0; i < ART_SIZE * ART_SIZE; i++, p += 3)
-        np.art[i] = rgb(artGamma[p[0]], artGamma[p[1]], artGamma[p[2]]);
-    np.colorArtist = rgb(p[0], p[1], p[2]);
-    p += 3;
-
     // both strings must be terminated inside the packet
-    const char *artist = (const char *)p;
+    const uint8_t *p = packet + 4;
+    const char *artist = (const char *)p + artBytes + 3;
     const char *end = (const char *)packet + len;
     const char *title = (const char *)memchr(artist, 0, end - artist);
     if (!title || !memchr(++title, 0, end - title)) return;
 
-    if (strncmp(artist, np.artist, TEXT_MAX) || strncmp(title, np.title, TEXT_MAX) || !np.active)
-        np.textSince = millis();
-    strlcpy(np.artist, artist, TEXT_MAX);
-    strlcpy(np.title, title, TEXT_MAX);
-    np.artistWidth = text.getUTF8Width(np.artist);
-    np.titleWidth = text.getUTF8Width(np.title);
+    Track &t = np.track;
+    bool changed = strncmp(artist, t.artist, TEXT_MAX) || strncmp(title, t.title, TEXT_MAX);
+    if (changed && np.active)
+    {
+        np.previous = t;
+        np.slideSince = millis();
+    }
+    if (changed || !np.active) t.textSince = millis();
+
+    for (int i = 0; i < ART_SIZE * ART_SIZE; i++, p += 3)
+        t.art[i] = rgb(artGamma[p[0]], artGamma[p[1]], artGamma[p[2]]);
+    t.colorArtist = rgb(p[0], p[1], p[2]);
+    strlcpy(t.artist, artist, TEXT_MAX);
+    strlcpy(t.title, title, TEXT_MAX);
+    t.artistWidth = text.getUTF8Width(t.artist);
+    t.titleWidth = text.getUTF8Width(t.title);
 
     np.active = true;
     np.lastPacket = millis();
 }
 
-static void drawMarquee(const char *s, int width, int baseline, uint16_t color)
+static void drawMarquee(const char *s, int width, int baseline, uint16_t color, uint32_t since)
 {
     const int x0 = TEXT_X, area = LED_COLS - TEXT_X;
     int offset = 0;
@@ -281,7 +293,7 @@ static void drawMarquee(const char *s, int width, int baseline, uint16_t color)
     {
         uint32_t period = width + SCROLL_GAP;
         uint32_t cycle = SCROLL_HOLD_MS + period * 1000 / SCROLL_PX_PER_S;
-        uint32_t t = (millis() - np.textSince) % cycle;
+        uint32_t t = (millis() - since) % cycle;
         if (t > SCROLL_HOLD_MS) offset = (t - SCROLL_HOLD_MS) * SCROLL_PX_PER_S / 1000;
         text.drawUTF8(x0 - offset + period, baseline, s);
     }
@@ -289,17 +301,36 @@ static void drawMarquee(const char *s, int width, int baseline, uint16_t color)
     text.drawUTF8(x0 - offset, baseline, s);
 }
 
+// draws a track shifted down by dy rows; whatever leaves the panel is clipped
+static void drawTrack(const Track &t, int dy)
+{
+    drawMarquee(t.artist, t.artistWidth, ARTIST_BASELINE + dy, t.colorArtist, t.textSince);
+    drawMarquee(t.title, t.titleWidth, TITLE_BASELINE + dy, rgb(255, 255, 255), t.textSince);
+
+    // the gap and artwork go last so they cover text scrolling out to the left
+    matrix.fillRect(ART_SIZE, dy, TEXT_X - ART_SIZE, LED_ROWS, colorOff);
+    for (int y = 0; y < ART_SIZE; y++)
+        for (int x = 0; x < ART_SIZE; x++)
+            matrix.drawPixel(x, y + dy, t.art[y * ART_SIZE + x]);
+}
+
 static void drawNowPlaying()
 {
     matrix.fillScreen(colorOff);
-    drawMarquee(np.artist, np.artistWidth, ARTIST_BASELINE, np.colorArtist);
-    drawMarquee(np.title, np.titleWidth, TITLE_BASELINE, rgb(255, 255, 255));
 
-    // the gap and artwork go last so they cover text scrolling out to the left
-    matrix.fillRect(ART_SIZE, 0, TEXT_X - ART_SIZE, LED_ROWS, colorOff);
-    for (int y = 0; y < ART_SIZE; y++)
-        for (int x = 0; x < ART_SIZE; x++)
-            matrix.drawPixel(x, y, np.art[y * ART_SIZE + x]);
+    uint32_t elapsed = millis() - np.slideSince;
+    if (elapsed < SLIDE_MS)
+    {
+        // ease out: fast start, settles gently
+        float p = 1.0f - (float)elapsed / SLIDE_MS;
+        int dy = lroundf((1.0f - p * p) * LED_ROWS);
+        drawTrack(np.previous, dy);
+        drawTrack(np.track, dy - LED_ROWS);
+    }
+    else
+    {
+        drawTrack(np.track, 0);
+    }
 
     matrix.show();
 }
