@@ -17,11 +17,17 @@ It's a port of my earlier Arduino Uno build, [VisEQ](https://github.com/marcwing
 
 ## Build and flash
 
-The project uses [PlatformIO](https://platformio.org/). Dependencies (Adafruit Protomatter, arduinoFFT) are installed automatically.
+The project uses [PlatformIO](https://platformio.org/). Dependencies (Adafruit Protomatter, arduinoFFT, U8g2_for_Adafruit_GFX) are installed automatically.
 
 ```sh
 pio run -t upload
 pio device monitor   # optional, 115200 baud
+```
+
+That builds the plain spectrum analyzer. For the optional [now playing view](#now-playing-from-spotify-optional), add WiFi credentials before uploading:
+
+```sh
+cp src/secrets.h.example src/secrets.h   # git-ignored; fill in SSID and password
 ```
 
 ## Wiring
@@ -76,19 +82,40 @@ With the board powered and no audio plugged in, A3 should read about **1.65 V** 
 - **Only tap after the preamp.** Never split the turntable's phono signal.
 - **Hum:** if the hi-fi buzzes in step with the LEDs, power the MatrixPortal from a separate USB wall charger. If that doesn't help, add an RCA ground-loop isolator.
 
+## Now playing from Spotify (optional)
+
+Only built when `src/secrets.h` exists, see [Build and flash](#build-and-flash). When the turntable is silent, the panel can show what the [snapserver](https://github.com/marcwingduck/snapserver-lcd) is streaming: the album art at 16×16 on the left, with artist and title scrolling on the right in U8g2's 3×5 `tom_thumb` font, which includes umlauts. Paused or stopped means nothing is playing, so the panel goes blank.
+
+The board joins WiFi as `vinyl-matrix.local` and listens on UDP port 4210. snapserver-lcd sends one datagram per change and repeats it every 10 s. If nothing arrives for 30 s, or a stop packet comes in, the panel returns to the spectrum. If the board never connects, the spectrum runs as before.
+
+Vinyl always wins. The ADC only hears the turntable, so any signal above `SILENCE_FLOOR` switches to the spectrum straight away. The panel goes back to Spotify only after `VINYL_HOLD_MS` of silence.
+
+Datagram layout (version 4). Everything after byte 3 is only sent with `P`:
+
+| Bytes | Content |
+|-------|---------|
+| 0–1 | `NP` |
+| 2 | version, `4` |
+| 3 | `P` show, `S` stop |
+| 4–771 | 16×16 artwork, RGB888, row-major |
+| 772–774 | accent color RGB, used for the artist line |
+| 775… | artist `\0` title `\0`, UTF-8, Latin-1 characters only |
+
 ## Tuning
 
 All settings are `#define`s at the top of [src/main.cpp](src/main.cpp).
 
 | Setting | Default | What it does |
 |---------|---------|--------------|
-| `BRIGHTNESS` | 100 | Peak channel value, 0–255 |
 | `ATTACK_MS` | 25 | How fast bars rise. Lower it for punchier beats |
 | `RELEASE_MS` | 140 | How slowly bars sink. Raise it for calmer bars |
 | `PEAK_FALLOFF_MS` | 500 | How long a peak dot hangs before sinking |
-| `SILENCE_FLOOR` | 0.16 | Below this level the bars stay dark. Raise it if bars twitch during silence |
+| `SILENCE_FLOOR` | 0.16 | Below this level the bars stay dark. Raise it if bars twitch during silence, or if WiFi noise keeps the panel from switching to Spotify |
+| `ART_GAMMA` | 2.2 | Gamma correction for the artwork. Lower it if dark covers lose detail |
+| `SCROLL_PX_PER_S` | 15 | Marquee speed of artist and title |
+| `VINYL_HOLD_MS` | 3000 | Silence needed before Spotify takes the panel back |
 
-The colors are the `sage` and `lilac` RGB values in `setup()`.
+The colors are the `sage` and `lilac` RGB values in `setup()`. Everything runs at full brightness: dimming in software costs color depth (dark tones flicker and posterize), so tame the panel with a tinted film or smoked acrylic in front instead.
 
 **Input gain:** the samples are divided by `8.0f` in `sampleAudio()`. If the bars drop out in quiet passages, lower it. If they're at full height most of the time, raise it, or turn down the preamp output.
 
