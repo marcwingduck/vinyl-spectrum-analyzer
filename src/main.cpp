@@ -51,6 +51,7 @@ float vReal[FFT_N], vImag[FFT_N];
 ArduinoFFT<float> FFT(vReal, vImag, FFT_N, (float)SAMPLE_HZ);
 
 float bands[BANDS];
+float bandHistory[2][BANDS];  // the two frames before, for despiking
 uint8_t bandEdge[BANDS + 1];  // first FFT bin of each band, plus the end of the last
 float bandNoise[BANDS];       // NOISE_FLOOR_DB raised by the band's width: noise adds up per bin
 uint32_t sampleMicros;        // how long the last FFT_N samples took, to check SAMPLE_HZ is met
@@ -197,7 +198,14 @@ static void runFFT()
             power += mag * mag;
         }
 
-        bands[b] = 10.0f * log10f(max(power, 1e-12f));
+        // median of the last three frames: interference (the TV, a WiFi burst) lasts one
+        // frame and would leave a stray peak marker, music lasts longer
+        float db = 10.0f * log10f(max(power, 1e-12f));
+        float a = bandHistory[0][b], c = bandHistory[1][b];
+        bandHistory[0][b] = c;
+        bandHistory[1][b] = db;
+        bands[b] = max(min(a, c), min(max(a, c), db));
+
         maxDb = max(maxDb, bands[b]);
         maxSignal = max(maxSignal, bands[b] - bandNoise[b]);
     }
