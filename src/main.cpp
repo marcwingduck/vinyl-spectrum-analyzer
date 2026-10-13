@@ -11,6 +11,7 @@
 #include <U8g2_for_Adafruit_GFX.h>
 #include <WiFi.h>
 #include <WiFiUdp.h>
+
 #include "secrets.h"
 #endif
 
@@ -24,13 +25,18 @@
 #define SAMPLE_HZ 12000  // 6 kHz span; analogRead takes ~75 us, so ~13 kHz is the ceiling
 #define BIN_WIDTH 2      // columns sharing one band, as the sketch booted on AVR
 #define BANDS (LED_COLS / BIN_WIDTH)
-#define BAND_LOW_HZ 60   // bands are spaced logarithmically from here up to SAMPLE_HZ / 2
+#define BAND_LOW_HZ 60  // bands are spaced logarithmically from here up to SAMPLE_HZ / 2
 
 #define PEAK_FALLOFF_MS 500  // how long a peak marker hangs before sinking
 #define NOISE_FLOOR_DB -28   // per-bin noise level; raise if bars twitch with the needle up
 #define DISPLAY_DB 30        // range the bars show, from the recent loudest band down
 #define MM_SIZE 32           // frames averaged for the scale and silence detection
-#define ATTACK_MS 25    // how fast bars rise to a new level
+#define ATTACK_MS 25         // how fast bars rise to a new level
+#define BOOT_MS 2000         // the cassette's loading bar fills over this long
+#define BOOT_HOLD_MS 1000    // then the loaded tape stays before anything takes over
+#define REEL_STEP_MS 500
+#define FADE_FROM 0.5f       // fade start; much lower and colors tint, 5 bits per channel
+#define GAMMA 2.2f      // LEDs are linear, images are sRGB
 #define RELEASE_MS 140  // how slowly they sink back; raise for calmer bars
 
 // MatrixPortal S3 pins (as in Adafruit's Protomatter examples)
@@ -82,22 +88,69 @@ static uint16_t rgb(uint8_t r, uint8_t g, uint8_t b)
     return (r >> 3 << 11) | (g >> 3 << 6) | (b >> 3);
 }
 
-static void resetPeaks()
+// boot screen, from cassette.png: '.' is off, letters index cassettePalette
+static const char* const cassette[LED_ROWS] = {
+    ".....AAAAAAAAAAAAAAAAAAAAAA.....",
+    "....AABBBBBBBBBBBBBBBBBBBBAA....",
+    "....ABBBBBBBBBBBBBBBBBBBBBBA....",
+    "....ABBBBBBBBBBBBBBBBBBBBBBA....",
+    "....ABBBBBBBBBBBBBBBBBBBBBBA....",
+    "....ABBBBB............BBBBBA....",
+    "....ABBBB.CC.DDDDDD.CC.BBBBA....",
+    "....ABBBB.CC.DDDDDD.CC.BBBBA....",
+    "....ABBBBB............BBBBBA....",
+    "....ABBBBBBBBBBBBBBBBBBBBBBA....",
+    "....AABBBBBBBBBBBBBBBBBBBBAA....",
+    "....AAAAA..............AAAAA....",
+    "....AAAA.AAAAAAAAAAAAAA.AAAA....",
+    "....AAAA.AAA.AAAAAA.AAA.AAAA....",
+    "....AAA.AA.AAAAAAAAAA.AA.AAA....",
+    ".....AA.AAAAAAAAAAAAAAAA.AA.....",
+};
+static const uint8_t cassettePalette[][3] = {
+    {164, 164, 164},  // A
+    {190, 70, 255},   // B
+    {255, 255, 255},  // C
+    {0, 0, 0},  // D
+};
+static const int reelX[] = {10, 20}, reelY = 6;  // top left of the 2x2 reel hubs
+static const int loadX = 13, loadW = 6;           // the D window, a loading bar over BOOT_MS
+bool cassetteShown = false;                       // drawn last frame, so a track can push it out
+uint32_t bootStart;                               // end of setup(), when the cassette appears
+
+static uint32_t bootElapsed() { return millis() - bootStart; }
+static bool booting() { return bootElapsed() < BOOT_MS + BOOT_HOLD_MS; }
+
+// draws the cassette shifted down by dy rows, its reels turning clockwise
+static void drawCassette(int dy)
 {
-    for (int i = 0; i < LED_COLS; i++)
+    // fade in step by step with the reels; scaled before gamma, so it looks even
+    uint32_t elapsed = bootElapsed();
+    int step = elapsed / REEL_STEP_MS;
+    const int fadeSteps = BOOT_MS / REEL_STEP_MS;  // fully lit when the bar is full
+    float level = FADE_FROM + (1.0f - FADE_FROM) * min(step, fadeSteps) / fadeSteps;
+    uint16_t cassetteColors[sizeof(cassettePalette) / 3];
+    for (size_t i = 0; i < sizeof(cassettePalette) / 3; i++)
     {
-        peaks[i] = LED_ROWS;
-        peakMillis[i] = millis();
+        uint8_t c[3];
+        for (int k = 0; k < 3; k++)
+            c[k] = lroundf(powf(cassettePalette[i][k] * level / 255.0f, GAMMA) * 255);
+        cassetteColors[i] = rgb(c[0], c[1], c[2]);
     }
 
-    // double buffering means each frame has to be redrawn whole, not appended
-    for (int i = 0; i < LED_COLS; i++)
-    {
-        matrix.fillScreen(colorOff);
-        for (int k = 0; k <= i; k++) matrix.drawPixel(k, 0, colorPeak);
-        matrix.show();
-        delay(13);
-    }
+    for (int y = 0; y < LED_ROWS; y++)
+        for (int x = 0; x < LED_COLS; x++)
+        {
+            char c = cassette[y][x];
+            if (c == '.') continue;
+            if (c == 'D' && x - loadX < (int)(elapsed * loadW / BOOT_MS)) c = 'C';  // loaded part
+            matrix.drawPixel(x, y + dy, cassetteColors[c - 'A']);
+        }
+
+    // one dark pixel circling each hub reads as rotation
+    static const uint8_t dx[] = {0, 1, 1, 0}, dyHub[] = {0, 0, 1, 1};
+    int phase = step % 4;
+    for (int x : reelX) matrix.drawPixel(x + dx[phase], reelY + dyHub[phase] + dy, colorOff);
 }
 
 static void sampleAudio()
@@ -108,7 +161,9 @@ static void sampleAudio()
 
     for (int i = 0; i < FFT_N; i++)
     {
-        while ((int32_t)(micros() - next) < 0) {}
+        while ((int32_t)(micros() - next) < 0)
+        {
+        }
         next += period;
 
         int raw = analogRead(AUDIO_PIN);
@@ -195,20 +250,20 @@ static void draw()
 
 #ifdef NOW_PLAYING
 // now playing, pushed by snapserver-lcd over UDP
-#define HOSTNAME "vinyl-matrix"     // reachable as vinyl-matrix.local
+#define HOSTNAME "vinyl-matrix"  // reachable as vinyl-matrix.local
 #define NP_PORT 4210
-#define NP_TIMEOUT_MS 30000         // sender repeats every 10 s; drop the view after this
-#define VINYL_HOLD_MS 3000          // silence needed before handing the panel to spotify
+#define NP_TIMEOUT_MS 30000  // sender repeats every 10 s; drop the view after this
+#define HELLO_MS 2000        // until snapserver-lcd answers, ask it for the state this often
+#define VINYL_HOLD_MS 3000   // silence needed before handing the panel to spotify
 #define ART_SIZE 16
-#define ART_GAMMA 2.2f              // LEDs are linear, album art is sRGB
 #define TEXT_MAX 128
 #define SCROLL_PX_PER_S 15
-#define SCROLL_HOLD_MS 1500         // pause at the start of each marquee cycle
-#define SCROLL_GAP 8                // blank pixels between marquee repeats
-#define TEXT_X (ART_SIZE + 1)       // one blank column between artwork and text
-#define TITLE_BASELINE 15           // 3x5 font: caps on rows 10-14, descenders on the bottom row
-#define ARTIST_BASELINE 9           // one font line (6 px) above: caps on rows 4-8
-#define SLIDE_MS 500                // a new song pushes the old one down and out
+#define SCROLL_HOLD_MS 1500    // pause at the start of each marquee cycle
+#define SCROLL_GAP 8           // blank pixels between marquee repeats
+#define TEXT_X (ART_SIZE + 1)  // one blank column between artwork and text
+#define TITLE_BASELINE 15      // 3x5 font: caps on rows 10-14, descenders on the bottom row
+#define ARTIST_BASELINE 9      // one font line (6 px) above: caps on rows 4-8
+#define SLIDE_MS 500           // a new song pushes the old one down and out
 
 U8G2_FOR_ADAFRUIT_GFX text;
 
@@ -226,14 +281,22 @@ struct NowPlaying
     bool active = false;
     uint32_t lastPacket = 0;
     uint32_t slideSince = 0;
+    bool visible = false;  // drawn last frame
+    enum
+    {
+        FROM_BLANK,
+        FROM_CASSETTE,
+        FROM_TRACK
+    } slideFrom;
     Track track, previous;  // previous is only drawn while it slides out
 } np;
 
 WiFiUDP udp;
 uint8_t packet[1200];
 uint8_t artGamma[256];
-uint32_t lastVinyl = 0;
+uint32_t lastVinyl = -VINYL_HOLD_MS;  // no vinyl yet, so a track can take over right at boot
 bool mdnsStarted = false;
+bool heardFromPi = false;
 
 // Packet: "NP" version cmd, then for cmd 'P':
 // 16x16 RGB888 art (row-major), accent RGB, artist\0, title\0 (UTF-8)
@@ -246,6 +309,7 @@ static void receiveNowPlaying()
 
     const int artBytes = ART_SIZE * ART_SIZE * 3;
     if (len < 4 || packet[0] != 'N' || packet[1] != 'P' || packet[2] != 4) return;
+    heardFromPi = true;
 
     if (packet[3] == 'S')
     {
@@ -255,17 +319,18 @@ static void receiveNowPlaying()
     if (packet[3] != 'P' || len < 4 + artBytes + 3 + 2) return;
 
     // both strings must be terminated inside the packet
-    const uint8_t *p = packet + 4;
-    const char *artist = (const char *)p + artBytes + 3;
-    const char *end = (const char *)packet + len;
-    const char *title = (const char *)memchr(artist, 0, end - artist);
+    const uint8_t* p = packet + 4;
+    const char* artist = (const char*)p + artBytes + 3;
+    const char* end = (const char*)packet + len;
+    const char* title = (const char*)memchr(artist, 0, end - artist);
     if (!title || !memchr(++title, 0, end - title)) return;
 
-    Track &t = np.track;
+    Track& t = np.track;
     bool changed = strncmp(artist, t.artist, TEXT_MAX) || strncmp(title, t.title, TEXT_MAX);
-    if (changed && np.active)
+    if (changed && np.visible)
     {
         np.previous = t;
+        np.slideFrom = NowPlaying::FROM_TRACK;
         np.slideSince = millis();
     }
     if (changed || !np.active) t.textSince = millis();
@@ -282,7 +347,7 @@ static void receiveNowPlaying()
     np.lastPacket = millis();
 }
 
-static void drawMarquee(const char *s, int width, int baseline, uint16_t color, uint32_t since)
+static void drawMarquee(const char* s, int width, int baseline, uint16_t color, uint32_t since)
 {
     const int x0 = TEXT_X, area = LED_COLS - TEXT_X;
     int offset = 0;
@@ -302,7 +367,7 @@ static void drawMarquee(const char *s, int width, int baseline, uint16_t color, 
 }
 
 // draws a track shifted down by dy rows; whatever leaves the panel is clipped
-static void drawTrack(const Track &t, int dy)
+static void drawTrack(const Track& t, int dy)
 {
     drawMarquee(t.artist, t.artistWidth, ARTIST_BASELINE + dy, t.colorArtist, t.textSince);
     drawMarquee(t.title, t.titleWidth, TITLE_BASELINE + dy, rgb(255, 255, 255), t.textSince);
@@ -324,7 +389,8 @@ static void drawNowPlaying()
         // ease out: fast start, settles gently
         float p = 1.0f - (float)elapsed / SLIDE_MS;
         int dy = lroundf((1.0f - p * p) * LED_ROWS);
-        drawTrack(np.previous, dy);
+        if (np.slideFrom == NowPlaying::FROM_TRACK) drawTrack(np.previous, dy);
+        if (np.slideFrom == NowPlaying::FROM_CASSETTE) drawCassette(dy);
         drawTrack(np.track, dy - LED_ROWS);
     }
     else
@@ -338,7 +404,7 @@ static void drawNowPlaying()
 static void beginNowPlaying()
 {
     for (int i = 0; i < 256; i++)
-        artGamma[i] = (uint8_t)lroundf(powf(i / 255.0f, ART_GAMMA) * 255);
+        artGamma[i] = (uint8_t)lroundf(powf(i / 255.0f, GAMMA) * 255);
 
     text.begin(matrix);
     text.setFont(u8g2_font_tom_thumb_4x6_tf);  // smallest readable: 4 px per character, Latin-1
@@ -361,14 +427,33 @@ static bool updateNowPlaying()
         Serial.printf("WiFi up, %s.local -> %s\n", HOSTNAME, WiFi.localIP().toString().c_str());
     }
 
+    // a broadcast hello gets an immediate answer instead of waiting for the next heartbeat
+    static uint32_t lastHello = 0;
+    if (!heardFromPi && WiFi.status() == WL_CONNECTED && millis() - lastHello > HELLO_MS)
+    {
+        lastHello = millis();
+        udp.beginPacket(WiFi.broadcastIP(), NP_PORT);
+        udp.write((const uint8_t *)"NP\x04H", 4);
+        udp.endPacket();
+    }
+
     receiveNowPlaying();
     if (np.active && millis() - np.lastPacket > NP_TIMEOUT_MS) np.active = false;
 
     if (signalDb > 0.0f) lastVinyl = millis();
-    if (!np.active || millis() - lastVinyl <= VINYL_HOLD_MS) return false;
+    // waits for the boot animation to finish
+    bool visible = np.active && !booting() && millis() - lastVinyl > VINYL_HOLD_MS;
 
-    drawNowPlaying();
-    return true;
+    // appearing, the track slides in from the top, pushing the cassette out at boot
+    if (visible && !np.visible)
+    {
+        np.slideFrom = cassetteShown ? NowPlaying::FROM_CASSETTE : NowPlaying::FROM_BLANK;
+        np.slideSince = millis();
+    }
+    np.visible = visible;
+
+    if (visible) drawNowPlaying();
+    return visible;
 }
 #endif
 
@@ -414,7 +499,7 @@ void setup()
     beginNowPlaying();
 #endif
 
-    resetPeaks();
+    bootStart = millis();
 }
 
 void loop()
@@ -433,8 +518,20 @@ void loop()
     }
 
 #ifdef NOW_PLAYING
-    if (updateNowPlaying()) return;
+    bool nowPlaying = updateNowPlaying();
+    cassetteShown = false;
+    if (nowPlaying) return;
 #endif
 
+    if (booting())
+    {
+        matrix.fillScreen(colorOff);
+        drawCassette(0);
+        matrix.show();
+        cassetteShown = true;
+        return;
+    }
+
+    cassetteShown = false;
     draw();
 }

@@ -86,7 +86,7 @@ With the board powered and no audio plugged in, A3 should read about **1.65 V** 
 
 Only built when `src/secrets.h` exists, see [Build and flash](#build-and-flash). When the turntable is silent, the panel can show what the [snapserver](https://github.com/marcwingduck/snapserver-lcd) is streaming: the album art at 16×16 on the left, with artist and title scrolling on the right in U8g2's 3×5 `tom_thumb` font, which includes umlauts. Paused or stopped means nothing is playing, so the panel goes blank.
 
-The board joins WiFi as `vinyl-matrix.local` and listens on UDP port 4210. snapserver-lcd sends one datagram per change and repeats it every 10 s. If nothing arrives for 30 s, or a stop packet comes in, the panel returns to the spectrum. If the board never connects, the spectrum runs as before.
+The board joins WiFi as `vinyl-matrix.local` and listens on UDP port 4210. snapserver-lcd sends one datagram per change and repeats it every 10 s. Once on WiFi, the board broadcasts a hello, which snapserver-lcd answers right away, so a track that is already playing shows up as soon as the boot animation ends. If nothing arrives for 30 s, or a stop packet comes in, the panel returns to the spectrum. If the board never connects, the spectrum runs as before.
 
 Vinyl always wins. The ADC only hears the turntable, so any band above its noise floor switches to the spectrum straight away. The panel goes back to Spotify only after `VINYL_HOLD_MS` of silence.
 
@@ -96,7 +96,7 @@ Datagram layout (version 4). Everything after byte 3 is only sent with `P`:
 |-------|---------|
 | 0–1 | `NP` |
 | 2 | version, `4` |
-| 3 | `P` show, `S` stop |
+| 3 | `P` show, `S` stop; `H` hello, broadcast by the board until the sender answers |
 | 4–771 | 16×16 artwork, RGB888, row-major |
 | 772–774 | accent color RGB, used for the artist line |
 | 775… | artist `\0` title `\0`, UTF-8, Latin-1 characters only |
