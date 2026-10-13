@@ -36,11 +36,14 @@
 #define DISPLAY_DB 30        // range the bars show, from the recent loudest band down
 #define MM_SIZE 32           // frames averaged for the scale and silence detection
 #define ATTACK_MS 25         // how fast bars rise to a new level
-#define BOOT_MS 2000         // the cassette's loading bar fills over this long
-#define BOOT_HOLD_MS 1000    // then the loaded tape stays before anything takes over
-#define SLIDE_MS 500         // pushes run this long: new album down, new title left, tape out
+// boot animation, one phase after the other; the reels turn and the tape winds throughout
+#define BOOT_FADE_MS 3000                                      // the cassette fades in
+#define BOOT_GLINT_MS 500                                      // then light sweeps across it
+#define BOOT_HOLD_MS 1500                                      // then it stays
+#define BOOT_MS (BOOT_FADE_MS + BOOT_GLINT_MS + BOOT_HOLD_MS)  // then the tape slides out
 #define REEL_STEP_MS 500
-#define FADE_FROM 0.5f       // fade start; much lower and colors tint, 5 bits per channel
+#define SLIDE_MS 500    // pushes run this long: new album down, new title left, tape out
+#define FADE_FROM 0.5f  // fade start; much lower and colors tint, 5 bits per channel
 #define GAMMA 2.2f      // LEDs are linear, images are sRGB
 #define RELEASE_MS 140  // how slowly they sink back; raise for calmer bars
 
@@ -97,40 +100,46 @@ static uint16_t rgb(uint8_t r, uint8_t g, uint8_t b)
     return (r >> 3 << 11) | (g >> 3 << 6) | (b >> 3);
 }
 
-// boot screen, from cassette.png: '.' is off, letters index cassettePalette
+// boot screen: '.' is off, letters index cassettePalette; lit from the top left
 static const char* const cassette[LED_ROWS] = {
-    ".....AAAAAAAAAAAAAAAAAAAAAA.....",
-    "....AABBBBBBBBBBBBBBBBBBBBAA....",
-    "....ABBBBBBBBBBBBBBBBBBBBBBA....",
-    "....ABBBBBBBBBBBBBBBBBBBBBBA....",
-    "....ABBBBBBBBBBBBBBBBBBBBBBA....",
-    "....ABBBBB............BBBBBA....",
-    "....ABBBB.CC.DDDDDD.CC.BBBBA....",
-    "....ABBBB.CC.DDDDDD.CC.BBBBA....",
-    "....ABBBBB............BBBBBA....",
-    "....ABBBBBBBBBBBBBBBBBBBBBBA....",
-    "....AABBBBBBBBBBBBBBBBBBBBAA....",
-    "....AAAAA..............AAAAA....",
-    "....AAAA.AAAAAAAAAAAAAA.AAAA....",
-    "....AAAA.AAA.AAAAAA.AAA.AAAA....",
-    "....AAA.AA.AAAAAAAAAA.AA.AAA....",
-    ".....AA.AAAAAAAAAAAAAAAA.AA.....",
+    ".....EEEEEEEEEEEEEEEEEEEEEE.....",
+    "....EGAAAAAAAAAAAAAAAAAAAAGF....",
+    "....EAABBBBBBBBBBBBBBBBBBAAF....",
+    "....EABBBBBBBBBBBBBBBBBBBBAF....",
+    "....EABBBBBBBBBBBBBBBBBBBBAF....",
+    "....EABBBAAAAAAAAAAAAAABBBAF....",
+    "....EABBBACCADDDDDDACCABBBAF....",
+    "....EABBBACCADDDDDDACCABBBAF....",
+    "....EABBBAAAAAAAAAAAAAABBBAF....",
+    "....EABBBBBBBBBBBBBBBBBBBBAF....",
+    "....EABBBBBBBBBBBBBBBBBBBBAF....",
+    "....EAAAAEEEEEEEEEEEEEEAAAAF....",
+    "....EAAAEAAAAAAAAAAAAAAFAAAF....",
+    "....EAAAEAAA.AAAAAA.AAAFAAAF....",
+    "....EGAEAA.AAAAAAAAAA.AAFAGF....",
+    ".....FFEFFFFFFFFFFFFFFFFFFF.....",
 };
 static const uint8_t cassettePalette[][3] = {
-    {164, 164, 164},  // A
-    {190, 70, 255},   // B
-    {255, 255, 255},  // C
-    {0, 0, 0},  // D
+    {100, 100, 100},  // A shell
+    {190, 70, 255},   // B label
+    {255, 255, 255},  // C reel hubs
+    {60, 40, 80},     // D window, smoked; the tape shows through
+    {255, 255, 255},  // E shell, lit edge
+    {64, 64, 64},     // F shell, shadow edge; LEDs lift darks, so go deep
+    {16, 16, 16},     // G screw
 };
-static const int reelX[] = {10, 20}, reelY = 6;  // top left of the 2x2 reel hubs
-static const int loadX = 13, loadW = 6;           // the D window, a loading bar over BOOT_MS
-bool cassetteShown = false;                       // drawn last frame, so a track can push it out
-uint32_t bootStart;                               // end of setup(), when the cassette appears
+static const int cassetteColorCount = sizeof(cassettePalette) / 3;
+static const float glintShine[] = {0.0f, 0.45f, 0.85f};  // blend toward white: none, edge, core
+static const int reelX[] = {10, 20}, reelY = 6;          // top left of the 2x2 reel hubs
+static const int loadX = 13, loadW = 6;                  // the D window between the hubs
+static const uint8_t tapeColor[3] = {180, 145, 72};      // amber; LEDs push warm tones red
+bool cassetteShown = false;                              // drawn last frame, so a track can push it out
+uint32_t bootStart;                                      // end of setup(), when the cassette appears
 
 static uint32_t bootElapsed() { return millis() - bootStart; }
-static bool booting() { return bootElapsed() < BOOT_MS + BOOT_HOLD_MS; }
+static bool booting() { return bootElapsed() < BOOT_MS; }
 // with nothing to push it out, the tape slides down on its own
-static bool ejecting() { return bootElapsed() < BOOT_MS + BOOT_HOLD_MS + SLIDE_MS; }
+static bool ejecting() { return bootElapsed() < BOOT_MS + SLIDE_MS; }
 
 // how far a push has come, 0..1 over SLIDE_MS; ease out: fast start, settles gently
 static float slideProgress(uint32_t elapsed)
@@ -139,21 +148,65 @@ static float slideProgress(uint32_t elapsed)
     return 1.0f - p * p;
 }
 
+static uint16_t cassetteColor(const uint8_t color[3], float level, float shine)
+{
+    uint8_t c[3];
+    for (int k = 0; k < 3; k++)
+    {
+        float v = color[k] + (255 - color[k]) * shine;
+        // rgb() drops the low 3 bits; round to the nearest step instead, or dim
+        // channels lose more than bright ones and faded colors shift hue (tape goes red)
+        int q = min(lroundf(powf(v * level / 255.0f, GAMMA) * 255) + 4, 255L);
+        // keep dim channels lit so the shadow edges don't pop in late and the
+        // cassette doesn't seem to grow
+        c[k] = v > 0 ? max(q, 8) : q;
+    }
+    return rgb(c[0], c[1], c[2]);
+}
+
+// how much of pixel (x, y) a tape pack of radius r around (cx, cy) covers, 0..1;
+// the partly covered edge pixel lets the pack grow smoothly
+static float packCoverage(int x, int y, float cx, float cy, float r)
+{
+    const int n = 4;
+    int inside = 0;
+    for (int i = 0; i < n; i++)
+        for (int j = 0; j < n; j++)
+        {
+            float px = x + (i + 0.5f) / n - cx, py = y + (j + 0.5f) / n - cy;
+            if (px * px + py * py <= r * r) inside++;
+        }
+    return (float)inside / (n * n);
+}
+
 // draws the cassette shifted down by dy rows, its reels turning clockwise
 static void drawCassette(int dy)
 {
     // fade in step by step with the reels; scaled before gamma, so it looks even
     uint32_t elapsed = bootElapsed();
     int step = elapsed / REEL_STEP_MS;
-    const int fadeSteps = BOOT_MS / REEL_STEP_MS;  // fully lit when the bar is full
+    const int fadeSteps = BOOT_FADE_MS / REEL_STEP_MS;
     float level = FADE_FROM + (1.0f - FADE_FROM) * min(step, fadeSteps) / fadeSteps;
-    uint16_t cassetteColors[sizeof(cassettePalette) / 3];
-    for (size_t i = 0; i < sizeof(cassettePalette) / 3; i++)
+    uint16_t colors[3][cassetteColorCount];
+    for (int s = 0; s < 3; s++)
+        for (int i = 0; i < cassetteColorCount; i++)
+            colors[s][i] = cassetteColor(cassettePalette[i], level, glintShine[s]);
+
+    // tape winds from the left reel to the right; its length is the packs' area,
+    // so one radius shrinks as the other grows. Empty, a pack just reaches the window
+    // a full pack fills 3.5 of the window's 6 px: the most that still leaves one
+    // column black between the packs halfway, when both are partly lit
+    const float hubY = reelY + 1.0f, rMin = loadX - (reelX[0] + 1.0f), rMax = rMin + 3.5f;
+    float wound = min(elapsed, (uint32_t)BOOT_MS) / (float)BOOT_MS;
+    float radius[2] = {sqrtf(rMax * rMax - (rMax * rMax - rMin * rMin) * wound),
+                       sqrtf(rMin * rMin + (rMax * rMax - rMin * rMin) * wound)};
+
+    // once loaded, a "/" band of light runs across, measured along 2x + y
+    int glint = -100;
+    if (elapsed >= BOOT_FADE_MS && elapsed - BOOT_FADE_MS < BOOT_GLINT_MS)
     {
-        uint8_t c[3];
-        for (int k = 0; k < 3; k++)
-            c[k] = lroundf(powf(cassettePalette[i][k] * level / 255.0f, GAMMA) * 255);
-        cassetteColors[i] = rgb(c[0], c[1], c[2]);
+        const int from = 2 * 4 - 4, to = 2 * 27 + LED_ROWS - 1 + 4;  // just off the shell
+        glint = from + (to - from) * (int)(elapsed - BOOT_FADE_MS) / BOOT_GLINT_MS;
     }
 
     for (int y = 0; y < LED_ROWS; y++)
@@ -161,8 +214,23 @@ static void drawCassette(int dy)
         {
             char c = cassette[y][x];
             if (c == '.') continue;
-            if (c == 'D' && x - loadX < (int)(elapsed * loadW / BOOT_MS)) c = 'C';  // loaded part
-            matrix.drawPixel(x, y + dy, cassetteColors[c - 'A']);
+            int d = abs(2 * x + y - glint), shine = d < 2 ? 2 : d < 4 ? 1
+                                                                      : 0;
+            if (c == 'D')
+            {
+                float cover = 0.0f;
+                for (int r = 0; r < 2; r++) cover = max(cover, packCoverage(x, y, reelX[r] + 1.0f, hubY, radius[r]));
+                if (cover > 0.15f)
+                {
+                    // the pack's edge pixel blends into the window by how much it covers
+                    uint8_t mixed[3];
+                    for (int k = 0; k < 3; k++)
+                        mixed[k] = lroundf(cassettePalette['D' - 'A'][k] + (tapeColor[k] - cassettePalette['D' - 'A'][k]) * cover);
+                    matrix.drawPixel(x, y + dy, cassetteColor(mixed, level, glintShine[shine]));
+                    continue;
+                }
+            }
+            matrix.drawPixel(x, y + dy, colors[c == 'G' ? 0 : shine][c - 'A']);
         }
 
     // one dark pixel circling each hub reads as rotation
@@ -572,7 +640,7 @@ static bool updateNowPlaying()
     {
         lastHello = millis();
         udp.beginPacket(WiFi.broadcastIP(), NP_PORT);
-        udp.write((const uint8_t *)"NP\x04H", 4);
+        udp.write((const uint8_t*)"NP\x04H", 4);
         udp.endPacket();
     }
 
@@ -591,7 +659,7 @@ static bool updateNowPlaying()
     if (visible && !np.visible)
     {
         np.slideFrom = cassetteShown ? NowPlaying::FROM_CASSETTE : NowPlaying::FROM_BLANK;
-        np.slideSince = cassetteShown ? bootStart + BOOT_MS + BOOT_HOLD_MS : millis();
+        np.slideSince = cassetteShown ? bootStart + BOOT_MS : millis();
     }
     np.visible = visible;
 
@@ -668,7 +736,7 @@ void loop()
 
     if (ejecting())
     {
-        int dy = booting() ? 0 : lroundf(slideProgress(bootElapsed() - BOOT_MS - BOOT_HOLD_MS) * LED_ROWS);
+        int dy = booting() ? 0 : lroundf(slideProgress(bootElapsed() - BOOT_MS) * LED_ROWS);
         matrix.fillScreen(colorOff);
         drawCassette(dy);
         matrix.show();
