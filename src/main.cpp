@@ -15,6 +15,10 @@
 #include "secrets.h"
 #endif
 
+// Uncomment to broadcast stray peaks while the turntable is silent (needs secrets.h).
+// Off, it costs nothing; see "Stray peaks while idle" in the README.
+#define IDLE_LOG
+
 #define LED_COLS 32
 #define LED_ROWS 16
 
@@ -52,6 +56,9 @@ float vReal[FFT_N], vImag[FFT_N];
 ArduinoFFT<float> FFT(vReal, vImag, FFT_N, (float)SAMPLE_HZ);
 
 float bands[BANDS];
+#ifdef IDLE_LOG
+float bandsRaw[BANDS];  // before despiking, for the UDP log
+#endif
 float bandHistory[2][BANDS];  // the two frames before, for despiking
 uint8_t bandEdge[BANDS + 1];  // first FFT bin of each band, plus the end of the last
 float bandNoise[BANDS];       // NOISE_FLOOR_DB raised by the band's width: noise adds up per bin
@@ -211,6 +218,9 @@ static void runFFT()
         // median of the last three frames: interference (the TV, a WiFi burst) lasts one
         // frame and would leave a stray peak marker, music lasts longer
         float db = 10.0f * log10f(max(power, 1e-12f));
+#ifdef IDLE_LOG
+        bandsRaw[b] = db;
+#endif
         float a = bandHistory[0][b], c = bandHistory[1][b];
         bandHistory[0][b] = c;
         bandHistory[1][b] = db;
@@ -270,6 +280,10 @@ static void draw()
 // now playing, pushed by snapserver-lcd over UDP
 #define HOSTNAME "vinyl-matrix"  // reachable as vinyl-matrix.local
 #define NP_PORT 4210
+#ifdef IDLE_LOG
+#define LOG_PORT 4211  // idle spikes and a heartbeat, broadcast; see the README to listen
+#define LOG_BEAT_MS 60000
+#endif
 #define NP_TIMEOUT_MS 30000  // sender repeats every 10 s; drop the view after this
 #define HELLO_MS 2000        // until snapserver-lcd answers, ask it for the state this often
 #define VINYL_HOLD_MS 3000   // silence needed before handing the panel to spotify
@@ -470,6 +484,78 @@ static void beginNowPlaying()
     udp.begin(NP_PORT);
 }
 
+#ifdef IDLE_LOG
+static void sendLog(const char* fmt, ...)
+{
+    char line[160];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(line, sizeof(line), fmt, args);
+    va_end(args);
+
+    udp.beginPacket(WiFi.broadcastIP(), LOG_PORT);
+    udp.printf("%s\n", line);
+    udp.endPacket();
+}
+
+// The needle is up, yet a band rises above its noise floor: reports each such burst
+// once it's over, with how loud it was before and after despiking.
+static void logIdle()
+{
+    if (WiFi.status() != WL_CONNECTED) return;
+
+    static uint32_t lastBeat = -LOG_BEAT_MS;
+    if (millis() - lastBeat > LOG_BEAT_MS)
+    {
+        lastBeat = millis();
+        sendLog("%lus alive, above noise %+.1f dB, WiFi %d dBm", millis() / 1000, signalDb,
+                WiFi.RSSI());
+    }
+
+    static struct Spike
+    {
+        uint32_t since = 0;
+        int frames = 0, band = 0;
+        float raw = 0.0f, filtered = -1e9f;  // dB above the noise floor
+    } spike;
+
+    int band = -1;
+    float raw = 0.0f, filtered = -1e9f;
+    if (!booting() && millis() - lastVinyl > VINYL_HOLD_MS)
+        for (int b = 0; b < BANDS; b++)
+        {
+            if (bandsRaw[b] - bandNoise[b] > raw)
+            {
+                raw = bandsRaw[b] - bandNoise[b];
+                band = b;
+            }
+            filtered = max(filtered, bands[b] - bandNoise[b]);
+        }
+
+    if (band >= 0)
+    {
+        if (!spike.frames) spike.since = millis();
+        spike.frames++;
+        if (raw > spike.raw)
+        {
+            spike.raw = raw;
+            spike.band = band;
+        }
+        spike.filtered = max(spike.filtered, filtered);
+    }
+    else if (spike.frames)
+    {
+        const float binHz = (float)SAMPLE_HZ / FFT_N;
+        sendLog("%lus spike: band %d (%d-%d Hz), %+.1f dB for %d frame%s, after filter %+.1f dB%s",
+                spike.since / 1000, spike.band, (int)(bandEdge[spike.band] * binHz),
+                (int)(bandEdge[spike.band + 1] * binHz), spike.raw, spike.frames,
+                spike.frames == 1 ? "" : "s", spike.filtered,
+                spike.filtered > 0.0f ? " -> SHOWN" : "");
+        spike = Spike();
+    }
+}
+#endif
+
 // Draws the now playing view and returns true while Spotify plays and the
 // turntable is silent. The ADC only hears the turntable, so vinyl always wins.
 static bool updateNowPlaying()
@@ -494,6 +580,9 @@ static bool updateNowPlaying()
     if (np.active && millis() - np.lastPacket > NP_TIMEOUT_MS) np.active = false;
 
     if (signalDb > 0.0f) lastVinyl = millis();
+#ifdef IDLE_LOG
+    logIdle();
+#endif
     // waits for the boot animation to finish
     bool visible = np.active && !booting() && millis() - lastVinyl > VINYL_HOLD_MS;
 

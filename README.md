@@ -121,6 +121,14 @@ The colors are the `sage` and `lilac` RGB values in `setup()`. Everything runs a
 
 **Calibrating the noise floor:** run `pio device monitor`. Once a second the board prints how far the loudest band is above its noise floor. With the needle up it should stay a few dB below 0. If it reaches 0, raise `NOISE_FLOOR_DB` by that much plus ~3 dB, since the bars and the Spotify handover would otherwise react to noise. If it sits far below, lower the floor so quiet passages show more.
 
+**Stray peaks while idle:** with WiFi set up, the board needs no cable for this. Uncomment `#define IDLE_LOG` at the top of [src/main.cpp](src/main.cpp), flash, and listen on any machine in the network (macOS `nc -ul` stops after the first line):
+
+```sh
+python3 -c 'import socket,time;s=socket.socket(2,2);s.bind(("",4211));[print(time.strftime("%H:%M:%S"),d.decode(),end="",flush=True) for _ in iter(int,1) if (d:=s.recv(512))]'
+```
+
+Every minute the board broadcasts a heartbeat, and whenever a band rises above its noise floor while the turntable is silent, it sends one line: which band, how loud, how many frames, and how loud after the 3-frame median that hides one-frame interference. `-> SHOWN` marks the ones that made it onto the panel.
+
 ## License
 
 [MIT](LICENSE). The FFT library it builds against, [arduinoFFT](https://github.com/kosme/arduinoFFT), is GPL-3.0.
