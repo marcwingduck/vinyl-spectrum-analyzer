@@ -34,6 +34,7 @@
 #define ATTACK_MS 25         // how fast bars rise to a new level
 #define BOOT_MS 2000         // the cassette's loading bar fills over this long
 #define BOOT_HOLD_MS 1000    // then the loaded tape stays before anything takes over
+#define SLIDE_MS 500         // pushes run this long: new album down, new title left, tape out
 #define REEL_STEP_MS 500
 #define FADE_FROM 0.5f       // fade start; much lower and colors tint, 5 bits per channel
 #define GAMMA 2.2f      // LEDs are linear, images are sRGB
@@ -121,6 +122,15 @@ uint32_t bootStart;                               // end of setup(), when the ca
 
 static uint32_t bootElapsed() { return millis() - bootStart; }
 static bool booting() { return bootElapsed() < BOOT_MS + BOOT_HOLD_MS; }
+// with nothing to push it out, the tape slides down on its own
+static bool ejecting() { return bootElapsed() < BOOT_MS + BOOT_HOLD_MS + SLIDE_MS; }
+
+// how far a push has come, 0..1 over SLIDE_MS; ease out: fast start, settles gently
+static float slideProgress(uint32_t elapsed)
+{
+    float p = 1.0f - min(elapsed, (uint32_t)SLIDE_MS) / (float)SLIDE_MS;
+    return 1.0f - p * p;
+}
 
 // draws the cassette shifted down by dy rows, its reels turning clockwise
 static void drawCassette(int dy)
@@ -271,7 +281,6 @@ static void draw()
 #define TEXT_X (ART_SIZE + 1)  // one blank column between artwork and text
 #define TITLE_BASELINE 15      // 3x5 font: caps on rows 10-14, descenders on the bottom row
 #define ARTIST_BASELINE 9      // one font line (6 px) above: caps on rows 4-8
-#define SLIDE_MS 500           // a new album pushes the old one down, a new title the old one left
 
 U8G2_FOR_ADAFRUIT_GFX text;
 
@@ -416,9 +425,7 @@ static void drawNowPlaying()
     uint32_t elapsed = millis() - np.slideSince;
     if (elapsed < SLIDE_MS)
     {
-        // ease out: fast start, settles gently
-        float p = 1.0f - (float)elapsed / SLIDE_MS;
-        float eased = 1.0f - p * p;
+        float eased = slideProgress(elapsed);
         if (np.slideFrom == NowPlaying::FROM_TITLE)
         {
             // the new title pushes the old one left, under the artwork
@@ -490,11 +497,12 @@ static bool updateNowPlaying()
     // waits for the boot animation to finish
     bool visible = np.active && !booting() && millis() - lastVinyl > VINYL_HOLD_MS;
 
-    // appearing, the track slides in from the top, pushing the cassette out at boot
+    // appearing, the track slides in from the top, pushing the cassette out at boot;
+    // if the tape is already on its way down, the track joins in at the same height
     if (visible && !np.visible)
     {
         np.slideFrom = cassetteShown ? NowPlaying::FROM_CASSETTE : NowPlaying::FROM_BLANK;
-        np.slideSince = millis();
+        np.slideSince = cassetteShown ? bootStart + BOOT_MS + BOOT_HOLD_MS : millis();
     }
     np.visible = visible;
 
@@ -569,10 +577,11 @@ void loop()
     if (nowPlaying) return;
 #endif
 
-    if (booting())
+    if (ejecting())
     {
+        int dy = booting() ? 0 : lroundf(slideProgress(bootElapsed() - BOOT_MS - BOOT_HOLD_MS) * LED_ROWS);
         matrix.fillScreen(colorOff);
-        drawCassette(0);
+        drawCassette(dy);
         matrix.show();
         cassetteShown = true;
         return;
