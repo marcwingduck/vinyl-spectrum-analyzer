@@ -263,13 +263,13 @@ static void draw()
 #define TEXT_X (ART_SIZE + 1)  // one blank column between artwork and text
 #define TITLE_BASELINE 15      // 3x5 font: caps on rows 10-14, descenders on the bottom row
 #define ARTIST_BASELINE 9      // one font line (6 px) above: caps on rows 4-8
-#define SLIDE_MS 500           // a new song pushes the old one down and out
+#define SLIDE_MS 500           // a new album pushes the old one down, a new title the old one left
 
 U8G2_FOR_ADAFRUIT_GFX text;
 
 struct Track
 {
-    uint32_t textSince;  // marquee start
+    uint32_t artistSince, titleSince;  // marquee starts
     uint16_t art[ART_SIZE * ART_SIZE];
     uint16_t colorArtist;
     char artist[TEXT_MAX], title[TEXT_MAX];
@@ -286,7 +286,8 @@ struct NowPlaying
     {
         FROM_BLANK,
         FROM_CASSETTE,
-        FROM_TRACK
+        FROM_TRACK,
+        FROM_TITLE  // same album: only the title changes
     } slideFrom;
     Track track, previous;  // previous is only drawn while it slides out
 } np;
@@ -325,18 +326,25 @@ static void receiveNowPlaying()
     const char* title = (const char*)memchr(artist, 0, end - artist);
     if (!title || !memchr(++title, 0, end - title)) return;
 
+    uint16_t art[ART_SIZE * ART_SIZE];
+    for (int i = 0; i < ART_SIZE * ART_SIZE; i++, p += 3)
+        art[i] = rgb(artGamma[p[0]], artGamma[p[1]], artGamma[p[2]]);
+
+    // no album in the packet, but its tracks share the cover, which downscales identically
     Track& t = np.track;
-    bool changed = strncmp(artist, t.artist, TEXT_MAX) || strncmp(title, t.title, TEXT_MAX);
-    if (changed && np.visible)
+    bool artistChanged = strncmp(artist, t.artist, TEXT_MAX);
+    bool titleChanged = strncmp(title, t.title, TEXT_MAX);
+    bool albumChanged = artistChanged || memcmp(art, t.art, sizeof(art));
+    if ((artistChanged || titleChanged) && np.visible)
     {
         np.previous = t;
-        np.slideFrom = NowPlaying::FROM_TRACK;
+        np.slideFrom = albumChanged ? NowPlaying::FROM_TRACK : NowPlaying::FROM_TITLE;
         np.slideSince = millis();
     }
-    if (changed || !np.active) t.textSince = millis();
+    if (albumChanged || !np.active) t.artistSince = millis();
+    if (artistChanged || titleChanged || !np.active) t.titleSince = millis();
 
-    for (int i = 0; i < ART_SIZE * ART_SIZE; i++, p += 3)
-        t.art[i] = rgb(artGamma[p[0]], artGamma[p[1]], artGamma[p[2]]);
+    memcpy(t.art, art, sizeof(art));
     t.colorArtist = rgb(p[0], p[1], p[2]);
     strlcpy(t.artist, artist, TEXT_MAX);
     strlcpy(t.title, title, TEXT_MAX);
@@ -347,9 +355,9 @@ static void receiveNowPlaying()
     np.lastPacket = millis();
 }
 
-static void drawMarquee(const char* s, int width, int baseline, uint16_t color, uint32_t since)
+static void drawMarquee(const char* s, int width, int dx, int baseline, uint16_t color, uint32_t since)
 {
-    const int x0 = TEXT_X, area = LED_COLS - TEXT_X;
+    const int x0 = TEXT_X + dx, area = LED_COLS - TEXT_X;
     int offset = 0;
 
     text.setForegroundColor(color);
@@ -366,17 +374,31 @@ static void drawMarquee(const char* s, int width, int baseline, uint16_t color, 
     text.drawUTF8(x0 - offset, baseline, s);
 }
 
-// draws a track shifted down by dy rows; whatever leaves the panel is clipped
-static void drawTrack(const Track& t, int dy)
+static void drawArtist(const Track& t, int dy)
 {
-    drawMarquee(t.artist, t.artistWidth, ARTIST_BASELINE + dy, t.colorArtist, t.textSince);
-    drawMarquee(t.title, t.titleWidth, TITLE_BASELINE + dy, rgb(255, 255, 255), t.textSince);
+    drawMarquee(t.artist, t.artistWidth, 0, ARTIST_BASELINE + dy, t.colorArtist, t.artistSince);
+}
 
-    // the gap and artwork go last so they cover text scrolling out to the left
+static void drawTitle(const Track& t, int dx, int dy)
+{
+    drawMarquee(t.title, t.titleWidth, dx, TITLE_BASELINE + dy, rgb(255, 255, 255), t.titleSince);
+}
+
+// the gap and artwork go last so they cover text scrolling out to the left
+static void drawArt(const Track& t, int dy)
+{
     matrix.fillRect(ART_SIZE, dy, TEXT_X - ART_SIZE, LED_ROWS, colorOff);
     for (int y = 0; y < ART_SIZE; y++)
         for (int x = 0; x < ART_SIZE; x++)
             matrix.drawPixel(x, y + dy, t.art[y * ART_SIZE + x]);
+}
+
+// draws a track shifted down by dy rows; whatever leaves the panel is clipped
+static void drawTrack(const Track& t, int dy)
+{
+    drawArtist(t, dy);
+    drawTitle(t, 0, dy);
+    drawArt(t, dy);
 }
 
 static void drawNowPlaying()
@@ -388,10 +410,26 @@ static void drawNowPlaying()
     {
         // ease out: fast start, settles gently
         float p = 1.0f - (float)elapsed / SLIDE_MS;
-        int dy = lroundf((1.0f - p * p) * LED_ROWS);
-        if (np.slideFrom == NowPlaying::FROM_TRACK) drawTrack(np.previous, dy);
-        if (np.slideFrom == NowPlaying::FROM_CASSETTE) drawCassette(dy);
-        drawTrack(np.track, dy - LED_ROWS);
+        float eased = 1.0f - p * p;
+        if (np.slideFrom == NowPlaying::FROM_TITLE)
+        {
+            // the new title pushes the old one left, under the artwork
+            const int area = LED_COLS - TEXT_X;
+            int edge = LED_COLS - lroundf(eased * area);
+            drawArtist(np.track, 0);
+            drawTitle(np.previous, edge - LED_COLS, 0);
+            // a long old title would run on under the new one
+            matrix.fillRect(edge, ARTIST_BASELINE + 1, LED_COLS - edge, LED_ROWS, colorOff);
+            drawTitle(np.track, edge - TEXT_X, 0);
+            drawArt(np.track, 0);
+        }
+        else
+        {
+            int dy = lroundf(eased * LED_ROWS);
+            if (np.slideFrom == NowPlaying::FROM_TRACK) drawTrack(np.previous, dy);
+            if (np.slideFrom == NowPlaying::FROM_CASSETTE) drawCassette(dy);
+            drawTrack(np.track, dy - LED_ROWS);
+        }
     }
     else
     {
