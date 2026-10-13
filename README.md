@@ -114,7 +114,7 @@ All settings are `#define`s at the top of [src/main.cpp](src/main.cpp).
 | `DISPLAY_DB` | 30 | Range the bars cover below the recent loudest band. Lower it for livelier bars |
 | `SAMPLE_HZ` | 12000 | `analogRead()` takes ~75 µs, so ~13 kHz is the ceiling. The serial monitor shows the rate actually reached |
 | `ART_GAMMA` | 2.2 | Gamma correction for the artwork. Lower it if dark covers lose detail |
-| `SCROLL_PX_PER_S` | 15 | Marquee speed of artist and title |
+| `SCROLL_MS_PER_PX` | 70 | Marquee speed of artist and title, ~14 px/s. Rounded to whole frames (one audio block each, ~21 ms at the default `FFT_N` and `SAMPLE_HZ`) so every step is equally long |
 | `VINYL_HOLD_MS` | 3000 | Silence needed before Spotify takes the panel back |
 
 The colors are the `sage` and `lilac` RGB values in `setup()`. Everything runs at full brightness: dimming in software costs color depth (dark tones flicker and posterize), so tame the panel with a tinted film or smoked acrylic in front instead.

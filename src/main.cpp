@@ -70,6 +70,7 @@ uint8_t peaks[LED_COLS];
 uint32_t peakMillis[LED_COLS];
 float barLevel[LED_COLS];
 uint32_t lastDraw = 0;
+uint32_t frames = 0;  // loop() runs, one per audio block
 
 uint16_t colorOff, colorPeak, colorRow[LED_ROWS];
 
@@ -357,8 +358,14 @@ static void draw()
 #define VINYL_HOLD_MS 3000   // silence needed before handing the panel to spotify
 #define ART_SIZE 16
 #define TEXT_MAX 128
-#define SCROLL_PX_PER_S 15
+#define SCROLL_MS_PER_PX 70   // marquee speed, ~14 px/s
 #define SCROLL_HOLD_MS 1500    // pause at the start of each marquee cycle
+// The panel changes once per frame, one audio block plus ~1-2 ms of FFT and drawing.
+// Stepping by time would move a pixel after 2 frames, then 3, which reads as judder,
+// so the marquee steps every whole number of frames, rounded from the speed above.
+#define FRAME_MS (1000.0f * FFT_N / SAMPLE_HZ)
+static const uint32_t scrollFramesPerPx = max(1, (int)(SCROLL_MS_PER_PX / FRAME_MS + 0.5f));
+static const uint32_t scrollHoldFrames = (uint32_t)(SCROLL_HOLD_MS / FRAME_MS + 0.5f);
 #define SCROLL_GAP 8           // blank pixels between marquee repeats
 #define TEXT_X (ART_SIZE + 1)  // one blank column between artwork and text
 #define TITLE_BASELINE 15      // 3x5 font: caps on rows 10-14, descenders on the bottom row
@@ -368,7 +375,7 @@ U8G2_FOR_ADAFRUIT_GFX text;
 
 struct Track
 {
-    uint32_t artistSince, titleSince;  // marquee starts
+    uint32_t artistSince, titleSince;  // marquee starts, in frames
     uint16_t art[ART_SIZE * ART_SIZE];
     uint16_t colorArtist;
     char artist[TEXT_MAX], title[TEXT_MAX];
@@ -440,8 +447,8 @@ static void receiveNowPlaying()
         np.slideFrom = albumChanged ? NowPlaying::FROM_TRACK : NowPlaying::FROM_TITLE;
         np.slideSince = millis();
     }
-    if (albumChanged || !np.active) t.artistSince = millis();
-    if (artistChanged || titleChanged || !np.active) t.titleSince = millis();
+    if (albumChanged || !np.active) t.artistSince = frames;
+    if (artistChanged || titleChanged || !np.active) t.titleSince = frames;
 
     memcpy(t.art, art, sizeof(art));
     t.colorArtist = rgb(p[0], p[1], p[2]);
@@ -464,9 +471,9 @@ static void drawMarquee(const char* s, int width, int dx, int baseline, uint16_t
     if (width > area)
     {
         uint32_t period = width + SCROLL_GAP;
-        uint32_t cycle = SCROLL_HOLD_MS + period * 1000 / SCROLL_PX_PER_S;
-        uint32_t t = (millis() - since) % cycle;
-        if (t > SCROLL_HOLD_MS) offset = (t - SCROLL_HOLD_MS) * SCROLL_PX_PER_S / 1000;
+        uint32_t cycle = scrollHoldFrames + period * scrollFramesPerPx;
+        uint32_t t = (frames - since) % cycle;
+        if (t > scrollHoldFrames) offset = (t - scrollHoldFrames) / scrollFramesPerPx;
         text.drawUTF8(x0 - offset + period, baseline, s);
     }
 
@@ -715,6 +722,7 @@ void setup()
 
 void loop()
 {
+    frames++;
     sampleAudio();
     runFFT();
 
