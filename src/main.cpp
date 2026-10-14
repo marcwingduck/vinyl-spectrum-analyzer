@@ -17,7 +17,7 @@
 
 // Uncomment to broadcast stray peaks while the turntable is silent (needs secrets.h).
 // Off, it costs nothing; see "Stray peaks while idle" in the README.
-#define IDLE_LOG
+// #define IDLE_LOG
 
 #define LED_COLS 32
 #define LED_ROWS 16
@@ -180,7 +180,8 @@ static float packCoverage(int x, int y, float cx, float cy, float r)
     return (float)inside / (n * n);
 }
 
-// draws the cassette shifted down by dy rows, its reels turning clockwise
+// draws the cassette shifted down by dy rows, its reels turning counterclockwise
+// as they do when the tape runs left to right past the head
 static void drawCassette(int dy)
 {
     // fade in step by step with the reels; scaled before gamma, so it looks even
@@ -234,8 +235,8 @@ static void drawCassette(int dy)
             matrix.drawPixel(x, y + dy, colors[c == 'G' ? 0 : shine][c - 'A']);
         }
 
-    // one dark pixel circling each hub reads as rotation
-    static const uint8_t dx[] = {0, 1, 1, 0}, dyHub[] = {0, 0, 1, 1};
+    // one dark pixel circling each hub reads as rotation: top left, bottom left, ...
+    static const uint8_t dx[] = {0, 0, 1, 1}, dyHub[] = {0, 1, 1, 0};
     int phase = step % 4;
     for (int x : reelX) matrix.drawPixel(x + dx[phase], reelY + dyHub[phase] + dy, colorOff);
 }
@@ -358,8 +359,8 @@ static void draw()
 #define VINYL_HOLD_MS 3000   // silence needed before handing the panel to spotify
 #define ART_SIZE 16
 #define TEXT_MAX 128
-#define SCROLL_MS_PER_PX 70   // marquee speed, ~14 px/s
-#define SCROLL_HOLD_MS 1500    // pause at the start of each marquee cycle
+#define SCROLL_MS_PER_PX 70  // marquee speed, ~14 px/s
+#define SCROLL_HOLD_MS 1500  // pause at the start of each marquee cycle
 // The panel changes once per frame, one audio block plus ~1-2 ms of FFT and drawing.
 // Stepping by time would move a pixel after 2 frames, then 3, which reads as judder,
 // so the marquee steps every whole number of frames, rounded from the speed above.
