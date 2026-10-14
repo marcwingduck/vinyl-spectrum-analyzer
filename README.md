@@ -110,16 +110,18 @@ All settings are `#define`s at the top of [src/main.cpp](src/main.cpp).
 | `ATTACK_MS` | 25 | How fast bars rise. Lower it for punchier beats |
 | `RELEASE_MS` | 140 | How slowly bars sink. Raise it for calmer bars |
 | `PEAK_FALLOFF_MS` | 500 | How long a peak dot hangs before sinking |
-| `NOISE_FLOOR_DB` | -28 | Per-bin noise level. Each bar only shows what rises above it, so silence stays dark and quiet passages still show. See below |
+| `bandNoiseDb` | measured | Default for each band's level with the needle up, until you calibrate with the UP button. Bars only show what rises above it, so silence stays dark and quiet passages still show. See below |
+| `NOISE_MARGIN_DB` | 6 | How far above its noise a band has to rise to show. Raise it if bars twitch with the needle up |
 | `DISPLAY_DB` | 30 | Range the bars cover below the recent loudest band. Lower it for livelier bars |
-| `SAMPLE_HZ` | 12000 | `analogRead()` takes ~75 µs, so ~13 kHz is the ceiling. The serial monitor shows the rate actually reached |
+| `SAMPLE_HZ` | 12000 | FFT sample rate, so the bars reach `SAMPLE_HZ / 2`. The ADC runs at `OVERSAMPLE` times this on its own timer (DMA), up to 83 kHz |
+| `OVERSAMPLE` | 4 | ADC samples averaged per FFT sample. Each doubling takes ~3 dB off random noise, not off hum |
 | `ART_GAMMA` | 2.2 | Gamma correction for the artwork. Lower it if dark covers lose detail |
 | `SCROLL_MS_PER_PX` | 70 | Marquee speed of artist and title, ~14 px/s. Rounded to whole frames (one audio block each, ~21 ms at the default `FFT_N` and `SAMPLE_HZ`) so every step is equally long |
 | `VINYL_HOLD_MS` | 3000 | Silence needed before Spotify takes the panel back |
 
 The colors are the `sage` and `lilac` RGB values in `setup()`. Everything runs at full brightness: dimming in software costs color depth (dark tones flicker and posterize), so tame the panel with a tinted film or smoked acrylic in front instead.
 
-**Calibrating the noise floor:** run `pio device monitor`. Once a second the board prints how far the loudest band is above its noise floor. With the needle up it should stay a few dB below 0. If it reaches 0, raise `NOISE_FLOOR_DB` by that much plus ~3 dB, since the bars and the Spotify handover would otherwise react to noise. If it sits far below, lower the floor so quiet passages show more.
+**Calibrating the noise floor:** the noise isn't even across bands. Mains hum puts 50 Hz and its harmonics well above the rest, so each band has its own floor. Calibrate wherever the board will run, since the hum depends on cables and power supply: lift the needle, then hold the **UP** button for 2 seconds. A progress bar runs for 15 seconds while each band is measured. The result is stored in flash and survives power cuts and firmware updates. Until the first calibration, the defaults in `bandNoiseDb` apply. With the needle up, `pio device monitor` should then show `above noise` around `-NOISE_MARGIN_DB`.
 
 **Stray peaks while idle:** with WiFi set up, the board needs no cable for this. Uncomment `#define IDLE_LOG` at the top of [src/main.cpp](src/main.cpp), flash, and listen on any machine in the network (macOS `nc -ul` stops after the first line):
 

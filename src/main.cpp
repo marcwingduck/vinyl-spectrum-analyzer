@@ -1,6 +1,8 @@
 #include <Adafruit_Protomatter.h>
 #include <Arduino.h>
 #include <arduinoFFT.h>
+#include <driver/adc.h>
+#include <Preferences.h>
 
 // Optional: with src/secrets.h (WiFi credentials) the board also shows what
 // snapserver-lcd is streaming while the turntable is silent. Without it, this
@@ -22,17 +24,20 @@
 #define LED_COLS 32
 #define LED_ROWS 16
 
-// GPIO10 / ADC1_CH9. A0 and A4 sit on ADC2, which stops working once WiFi runs.
-#define AUDIO_PIN A3
+// A3 = GPIO10 = ADC1 channel 9. A0 and A4 sit on ADC2, which stops working once WiFi runs.
+#define AUDIO_CHANNEL 9
 
 #define FFT_N 256        // 128 bins of ~47 Hz
-#define SAMPLE_HZ 12000  // 6 kHz span; analogRead takes ~75 us, so ~13 kHz is the ceiling
+#define SAMPLE_HZ 12000  // 6 kHz span
+#define OVERSAMPLE 4     // ADC samples averaged per FFT sample: ~6 dB less noise
 #define BIN_WIDTH 2      // columns sharing one band, as the sketch booted on AVR
 #define BANDS (LED_COLS / BIN_WIDTH)
 #define BAND_LOW_HZ 60  // bands are spaced logarithmically from here up to SAMPLE_HZ / 2
 
 #define PEAK_FALLOFF_MS 500  // how long a peak marker hangs before sinking
-#define NOISE_FLOOR_DB -28   // per-bin noise level; raise if bars twitch with the needle up
+#define NOISE_MARGIN_DB 6    // bars start this far above each band's measured noise
+#define CAL_HOLD_MS 2000     // hold the UP button this long to calibrate, with the needle up
+#define CAL_MS 15000         // calibration measures this long, keeping each band's loudest second
 #define DISPLAY_DB 30        // range the bars show, from the recent loudest band down
 #define MM_SIZE 32           // frames averaged for the scale and silence detection
 #define ATTACK_MS 25         // how fast bars rise to a new level
@@ -64,8 +69,18 @@ float bandsRaw[BANDS];  // before despiking, for the UDP log
 #endif
 float bandHistory[2][BANDS];  // the two frames before, for despiking
 uint8_t bandEdge[BANDS + 1];  // first FFT bin of each band, plus the end of the last
-float bandNoise[BANDS];       // NOISE_FLOOR_DB raised by the band's width: noise adds up per bin
-uint32_t sampleMicros;        // how long the last FFT_N samples took, to check SAMPLE_HZ is met
+// Each band's level with the needle up, in dB. Measured, because the noise isn't even:
+// mains hum puts 50 Hz and its harmonics well above the rest. Holding UP recalibrates
+// and stores the result in flash; these are the defaults until then.
+static const int8_t bandNoiseDb[BANDS] = {-34, -40, -43, -44, -45, -43, -39, -41,
+                                          -37, -36, -34, -34, -32, -32, -30, -29};
+float bandNoise[BANDS];       // where each band's bars start: its noise plus NOISE_MARGIN_DB
+float bandLevelSum[BANDS];    // summed for the print
+uint32_t bandLevelFrames;
+uint32_t samplesUsed;         // FFT samples taken since the last print, to check SAMPLE_HZ is met
+
+// one frame of DMA results, 4 bytes each
+uint8_t adcBuf[FFT_N * OVERSAMPLE * SOC_ADC_DIGI_RESULT_BYTES];
 uint8_t peaks[LED_COLS];
 uint32_t peakMillis[LED_COLS];
 float barLevel[LED_COLS];
@@ -241,25 +256,62 @@ static void drawCassette(int dy)
     for (int x : reelX) matrix.drawPixel(x + dx[phase], reelY + dyHub[phase] + dy, colorOff);
 }
 
+// The ADC samples on its own timer at SAMPLE_HZ * OVERSAMPLE and DMA collects the
+// results, so the timing is exact and sampling goes on while a frame is drawn.
+static void beginAudio()
+{
+    adc_digi_init_config_t init = {};
+    init.max_store_buf_size = sizeof(adcBuf) * 2;  // room for a frame of lag
+    init.conv_num_each_intr = 256 * SOC_ADC_DIGI_RESULT_BYTES;
+    init.adc1_chan_mask = BIT(AUDIO_CHANNEL);
+
+    static adc_digi_pattern_config_t pattern = {};
+    pattern.atten = ADC_ATTEN_DB_12;
+    pattern.channel = AUDIO_CHANNEL;
+    pattern.unit = 0;  // ADC1; Espressif's example encodes this in the channel, which breaks above 7
+    pattern.bit_width = SOC_ADC_DIGI_MAX_BITWIDTH;
+
+    adc_digi_configuration_t config = {};
+    config.pattern_num = 1;
+    config.adc_pattern = &pattern;
+    config.sample_freq_hz = SAMPLE_HZ * OVERSAMPLE;
+    config.conv_mode = ADC_CONV_SINGLE_UNIT_1;
+    config.format = ADC_DIGI_OUTPUT_FORMAT_TYPE2;
+
+    ESP_ERROR_CHECK(adc_digi_initialize(&init));
+    ESP_ERROR_CHECK(adc_digi_controller_configure(&config));
+    ESP_ERROR_CHECK(adc_digi_start());
+}
+
 static void sampleAudio()
 {
-    const uint32_t period = 1000000UL / SAMPLE_HZ;
-    uint32_t start = micros(), next = start;
     int32_t sum = 0;
+    int n = 0, k = 0;  // FFT samples filled, ADC samples in the current average
+    uint32_t acc = 0;
 
-    for (int i = 0; i < FFT_N; i++)
+    while (n < FFT_N)
     {
-        while ((int32_t)(micros() - next) < 0)
-        {
-        }
-        next += period;
+        // ask only for what is still missing, so no samples are thrown away
+        uint32_t want = ((FFT_N - n) * OVERSAMPLE - k) * SOC_ADC_DIGI_RESULT_BYTES, len = 0;
+        adc_digi_read_bytes(adcBuf, want, &len, ADC_MAX_DELAY);
 
-        int raw = analogRead(AUDIO_PIN);
-        vReal[i] = raw;
-        vImag[i] = 0.0f;
-        sum += raw;
+        for (uint32_t i = 0; i + SOC_ADC_DIGI_RESULT_BYTES <= len && n < FFT_N; i += SOC_ADC_DIGI_RESULT_BYTES)
+        {
+            const adc_digi_output_data_t *d = (const adc_digi_output_data_t *)&adcBuf[i];
+            if (d->type2.unit != 0 || d->type2.channel != AUDIO_CHANNEL) continue;
+
+            acc += d->type2.data;
+            if (++k < OVERSAMPLE) continue;
+
+            vReal[n] = (float)acc / OVERSAMPLE;
+            vImag[n] = 0.0f;
+            sum += acc / OVERSAMPLE;
+            n++;
+            k = 0;
+            acc = 0;
+        }
     }
-    sampleMicros = micros() - start;
+    samplesUsed += FFT_N;
 
     // subtract the measured bias rather than trusting the divider to sit at mid-rail
     float mean = (float)sum / FFT_N;
@@ -298,7 +350,9 @@ static void runFFT()
 
         maxDb = max(maxDb, bands[b]);
         maxSignal = max(maxSignal, bands[b] - bandNoise[b]);
+        bandLevelSum[b] += bands[b];
     }
+    bandLevelFrames++;
 
     peakDb = peakAvg.add(maxDb);
     signalDb = signalAvg.add(maxSignal);
@@ -676,12 +730,95 @@ static bool updateNowPlaying()
 }
 #endif
 
+// Calibration: hold UP with the needle up. For CAL_MS the panel shows a progress bar
+// while each band's level is averaged per second; the loudest second becomes the band's
+// noise, stored in flash so it survives power cuts and firmware updates.
+Preferences prefs;
+int8_t bandNoiseMeasured[BANDS];
+
+static void applyNoise(const int8_t *noise)
+{
+    memcpy(bandNoiseMeasured, noise, BANDS);
+    for (int b = 0; b < BANDS; b++) bandNoise[b] = noise[b] + NOISE_MARGIN_DB;
+}
+
+static void beginCalibration()
+{
+    pinMode(PIN_BUTTON_UP, INPUT_PULLUP);
+    int8_t stored[BANDS];
+    prefs.begin("vinyl");
+    bool have = prefs.getBytesLength("noise") == BANDS && prefs.getBytes("noise", stored, BANDS) == BANDS;
+    applyNoise(have ? stored : bandNoiseDb);
+}
+
+// returns true while calibrating, having drawn the frame
+static bool updateCalibration()
+{
+    static uint32_t pressedSince = 0, calStart = 0, secondStart = 0, calFrames = 0;
+    static bool calibrating = false, released = true;
+    static float sum[BANDS], loudest[BANDS];
+
+    bool pressed = digitalRead(PIN_BUTTON_UP) == LOW;
+    if (!pressed) released = true;
+    if (!calibrating)
+    {
+        if (!pressed || !released)
+        {
+            pressedSince = millis();
+            return false;
+        }
+        if (millis() - pressedSince < CAL_HOLD_MS) return false;
+
+        calibrating = true;
+        released = false;  // still held; a new hold is needed for the next run
+        calStart = secondStart = millis();
+        calFrames = 0;
+        for (int b = 0; b < BANDS; b++) sum[b] = 0.0f, loudest[b] = -1e9f;
+        Serial.println("calibrating noise floor, keep the needle up");
+    }
+
+    for (int b = 0; b < BANDS; b++) sum[b] += bands[b];
+    calFrames++;
+    if (millis() - secondStart >= 1000)
+    {
+        for (int b = 0; b < BANDS; b++)
+        {
+            loudest[b] = max(loudest[b], sum[b] / calFrames);
+            sum[b] = 0.0f;
+        }
+        calFrames = 0;
+        secondStart = millis();
+    }
+
+    uint32_t elapsed = millis() - calStart;
+    if (elapsed >= CAL_MS)
+    {
+        int8_t noise[BANDS];
+        Serial.print("calibrated: {");
+        for (int b = 0; b < BANDS; b++)
+        {
+            noise[b] = (int8_t)ceilf(loudest[b]);
+            Serial.printf(b ? ", %d" : "%d", noise[b]);
+        }
+        Serial.println("}");
+        prefs.putBytes("noise", noise, BANDS);
+        applyNoise(noise);
+        calibrating = false;
+        return false;
+    }
+
+    // progress bar across the middle rows
+    matrix.fillScreen(colorOff);
+    matrix.fillRect(0, LED_ROWS / 2 - 1, LED_COLS * elapsed / CAL_MS + 1, 2, colorPeak);
+    matrix.show();
+    return true;
+}
+
 void setup()
 {
     Serial.begin(115200);
 
-    analogReadResolution(12);
-    analogSetPinAttenuation(AUDIO_PIN, ADC_11db);
+    beginAudio();
 
     if (matrix.begin() != PROTOMATTER_OK)
     {
@@ -711,8 +848,7 @@ void setup()
         if (b > 0) bin = max(bin, bandEdge[b - 1] + 1);
         bandEdge[b] = min(bin, FFT_N / 2);
     }
-    for (int b = 0; b < BANDS; b++)
-        bandNoise[b] = NOISE_FLOOR_DB + 10.0f * log10f(bandEdge[b + 1] - bandEdge[b]);
+    beginCalibration();
 
 #ifdef NOW_PLAYING
     beginNowPlaying();
@@ -726,15 +862,28 @@ void loop()
     frames++;
     sampleAudio();
     runFFT();
+    if (updateCalibration()) return;
 
-    // for tuning NOISE_FLOOR_DB: with the needle up, "above noise" should stay a few dB
-    // below 0; add it to NOISE_FLOOR_DB if it doesn't
+    // with the needle up, "above noise" should sit around -NOISE_MARGIN_DB; if a band
+    // twitches, recalibrate (hold UP)
     static uint32_t lastPrint = 0;
     if (millis() - lastPrint > 1000)
     {
         lastPrint = millis();
-        Serial.printf("above noise %+.1f dB, peak %.1f dB, sampling at %lu Hz\n", signalDb, peakDb,
-                      1000000UL * FFT_N / sampleMicros);
+        // below SAMPLE_HZ means frames take longer than they last and samples get dropped
+        Serial.printf("above noise %+.1f dB, peak %.1f dB, keeping up with %lu of %d Hz\n", signalDb,
+                      peakDb, samplesUsed, SAMPLE_HZ);
+        samplesUsed = 0;
+
+        // each band's level; with the needle up, this row is what bandNoiseDb holds
+        Serial.print("  needle up: {");
+        for (int b = 0; b < BANDS; b++)
+        {
+            Serial.printf(b ? ", %.0f" : "%.0f", ceilf(bandLevelSum[b] / bandLevelFrames));
+            bandLevelSum[b] = 0.0f;
+        }
+        Serial.println("}");
+        bandLevelFrames = 0;
     }
 
 #ifdef NOW_PLAYING
