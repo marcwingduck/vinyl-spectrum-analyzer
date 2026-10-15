@@ -1,8 +1,8 @@
 #include <Adafruit_Protomatter.h>
 #include <Arduino.h>
+#include <Preferences.h>
 #include <arduinoFFT.h>
 #include <driver/adc.h>
-#include <Preferences.h>
 
 // Optional: with src/secrets.h (WiFi credentials) the board also shows what
 // snapserver-lcd is streaming while the turntable is silent. Without it, this
@@ -19,7 +19,7 @@
 
 // Uncomment to broadcast stray peaks while the turntable is silent (needs secrets.h).
 // Off, it costs nothing; see "Stray peaks while idle" in the README.
-// #define IDLE_LOG
+#define IDLE_LOG
 
 #define LED_COLS 32
 #define LED_ROWS 16
@@ -27,12 +27,12 @@
 // A3 = GPIO10 = ADC1 channel 9. A0 and A4 sit on ADC2, which stops working once WiFi runs.
 #define AUDIO_CHANNEL 9
 
-#define FFT_N 256        // 128 bins of ~47 Hz
-#define SAMPLE_HZ 12000  // 6 kHz span
-#define OVERSAMPLE 4     // ADC samples averaged per FFT sample: ~6 dB less noise
+#define FFT_N 512        // 256 bins of ~39 Hz
+#define SAMPLE_HZ 20000  // 10 kHz span
+#define OVERSAMPLE 4     // ADC samples averaged per FFT sample: ~6 dB less noise; ADC tops out at 83 kHz
 #define BIN_WIDTH 2      // columns sharing one band, as the sketch booted on AVR
 #define BANDS (LED_COLS / BIN_WIDTH)
-#define BAND_LOW_HZ 60  // bands are spaced logarithmically from here up to SAMPLE_HZ / 2
+#define BAND_LOW_HZ 40  // bands are spaced logarithmically from here up to SAMPLE_HZ / 2
 
 #define PEAK_FALLOFF_MS 500  // how long a peak marker hangs before sinking
 #define NOISE_MARGIN_DB 6    // bars start this far above each band's measured noise
@@ -43,8 +43,8 @@
 #define ATTACK_MS 25         // how fast bars rise to a new level
 // boot animation, one phase after the other; the reels turn and the tape winds throughout
 #define BOOT_FADE_MS 3000                                      // the cassette fades in
-#define BOOT_GLINT_MS 500                                      // then light sweeps across it
-#define BOOT_HOLD_MS 1500                                      // then it stays
+#define BOOT_GLINT_MS 1000                                     // then light sweeps across it
+#define BOOT_HOLD_MS 1000                                      // then it stays
 #define BOOT_MS (BOOT_FADE_MS + BOOT_GLINT_MS + BOOT_HOLD_MS)  // then the tape slides out
 #define REEL_STEP_MS 500
 #define SLIDE_MS 500    // pushes run this long: new album down, new title left, tape out
@@ -67,17 +67,20 @@ float bands[BANDS];
 #ifdef IDLE_LOG
 float bandsRaw[BANDS];  // before despiking, for the UDP log
 #endif
-float bandHistory[2][BANDS];  // the two frames before, for despiking
-uint8_t bandEdge[BANDS + 1];  // first FFT bin of each band, plus the end of the last
+float bandHistory[2][BANDS];   // the two frames before, for despiking
+uint16_t bandEdge[BANDS + 1];  // first FFT bin of each band, plus the end of the last
 // Each band's level with the needle up, in dB. Measured, because the noise isn't even:
 // mains hum puts 50 Hz and its harmonics well above the rest. Holding UP recalibrates
-// and stores the result in flash; these are the defaults until then.
+// and stores the result in flash; these are the defaults until then (measured with an
+// earlier band layout, so only rough: calibrate once after flashing).
 static const int8_t bandNoiseDb[BANDS] = {-34, -40, -43, -44, -45, -43, -39, -41,
                                           -37, -36, -34, -34, -32, -32, -30, -29};
-float bandNoise[BANDS];       // where each band's bars start: its noise plus NOISE_MARGIN_DB
-float bandLevelSum[BANDS];    // summed for the print
+float bandNoise[BANDS];     // where each band's bars start: its noise plus NOISE_MARGIN_DB
+char noiseStatus[160];      // where bandNoise came from, for serial and the UDP log
+bool noiseStatusNew;        // not yet sent over UDP
+float bandLevelSum[BANDS];  // summed for the print
 uint32_t bandLevelFrames;
-uint32_t samplesUsed;         // FFT samples taken since the last print, to check SAMPLE_HZ is met
+uint32_t samplesUsed;  // FFT samples taken since the last print, to check SAMPLE_HZ is met
 
 // one frame of DMA results, 4 bytes each
 uint8_t adcBuf[FFT_N * OVERSAMPLE * SOC_ADC_DIGI_RESULT_BYTES];
@@ -297,7 +300,7 @@ static void sampleAudio()
 
         for (uint32_t i = 0; i + SOC_ADC_DIGI_RESULT_BYTES <= len && n < FFT_N; i += SOC_ADC_DIGI_RESULT_BYTES)
         {
-            const adc_digi_output_data_t *d = (const adc_digi_output_data_t *)&adcBuf[i];
+            const adc_digi_output_data_t* d = (const adc_digi_output_data_t*)&adcBuf[i];
             if (d->type2.unit != 0 || d->type2.channel != AUDIO_CHANNEL) continue;
 
             acc += d->type2.data;
@@ -411,6 +414,7 @@ static void draw()
 #define NP_TIMEOUT_MS 30000  // sender repeats every 10 s; drop the view after this
 #define HELLO_MS 2000        // until snapserver-lcd answers, ask it for the state this often
 #define VINYL_HOLD_MS 3000   // silence needed before handing the panel to spotify
+#define VINYL_DB 6           // above the bars' floor before it counts as vinyl; hum wanders
 #define ART_SIZE 16
 #define TEXT_MAX 128
 #define SCROLL_MS_PER_PX 70  // marquee speed, ~14 px/s
@@ -443,6 +447,8 @@ struct NowPlaying
     uint32_t lastPacket = 0;
     uint32_t slideSince = 0;
     bool visible = false;  // drawn last frame
+    bool leaving = false;  // stopped: the track slides out at the bottom
+    uint32_t leaveSince = 0;
     enum
     {
         FROM_BLANK,
@@ -634,6 +640,33 @@ static void logIdle()
 {
     if (WiFi.status() != WL_CONNECTED) return;
 
+    if (noiseStatusNew)
+    {
+        sendLog("%lus %s", millis() / 1000, noiseStatus);
+        noiseStatusNew = false;
+    }
+
+    // the panel going to the spectrum and back: which band took it from Spotify
+    const float binHz = (float)SAMPLE_HZ / FFT_N;
+    static bool vinyl = false;
+    static uint32_t vinylSince = 0;
+    if ((millis() - lastVinyl <= VINYL_HOLD_MS) != vinyl)
+    {
+        vinyl = !vinyl;
+        if (vinyl)
+        {
+            int loudest = 0;
+            for (int b = 1; b < BANDS; b++)
+                if (bands[b] - bandNoise[b] > bands[loudest] - bandNoise[loudest]) loudest = b;
+            sendLog("%lus vinyl on: band %d (%d-%d Hz) %+.1f dB above its floor, needs %+d", millis() / 1000,
+                    loudest, (int)(bandEdge[loudest] * binHz), (int)(bandEdge[loudest + 1] * binHz),
+                    bands[loudest] - bandNoise[loudest], VINYL_DB);
+            vinylSince = millis();
+        }
+        else
+            sendLog("%lus vinyl off after %lus", millis() / 1000, (millis() - vinylSince) / 1000);
+    }
+
     static uint32_t lastBeat = -LOG_BEAT_MS;
     if (millis() - lastBeat > LOG_BEAT_MS)
     {
@@ -675,7 +708,6 @@ static void logIdle()
     }
     else if (spike.frames)
     {
-        const float binHz = (float)SAMPLE_HZ / FFT_N;
         sendLog("%lus spike: band %d (%d-%d Hz), %+.1f dB for %d frame%s, after filter %+.1f dB%s",
                 spike.since / 1000, spike.band, (int)(bandEdge[spike.band] * binHz),
                 (int)(bandEdge[spike.band + 1] * binHz), spike.raw, spike.frames,
@@ -709,12 +741,22 @@ static bool updateNowPlaying()
     receiveNowPlaying();
     if (np.active && millis() - np.lastPacket > NP_TIMEOUT_MS) np.active = false;
 
-    if (signalDb > 0.0f) lastVinyl = millis();
+    if (signalDb > VINYL_DB) lastVinyl = millis();
 #ifdef IDLE_LOG
     logIdle();
 #endif
     // waits for the boot animation to finish
-    bool visible = np.active && !booting() && millis() - lastVinyl > VINYL_HOLD_MS;
+    bool vinyl = millis() - lastVinyl <= VINYL_HOLD_MS;
+    bool visible = np.active && !booting() && !vinyl;
+
+    // stopped, the track slides out at the bottom like it does for a new one; vinyl
+    // takes the panel straight away
+    if (np.visible && !visible && !vinyl)
+    {
+        np.leaving = true;
+        np.leaveSince = millis();
+    }
+    if (visible || vinyl || millis() - np.leaveSince >= SLIDE_MS) np.leaving = false;
 
     // appearing, the track slides in from the top, pushing the cassette out at boot;
     // if the tape is already on its way down, the track joins in at the same height
@@ -726,7 +768,13 @@ static bool updateNowPlaying()
     np.visible = visible;
 
     if (visible) drawNowPlaying();
-    return visible;
+    if (np.leaving)
+    {
+        matrix.fillScreen(colorOff);
+        drawTrack(np.track, lroundf(slideProgress(millis() - np.leaveSince) * LED_ROWS));
+        matrix.show();
+    }
+    return visible || np.leaving;
 }
 #endif
 
@@ -734,12 +782,20 @@ static bool updateNowPlaying()
 // while each band's level is averaged per second; the loudest second becomes the band's
 // noise, stored in flash so it survives power cuts and firmware updates.
 Preferences prefs;
+#define NOISE_LAYOUT (SAMPLE_HZ * 1000u + FFT_N + BAND_LOW_HZ)  // changes when the bands do
 int8_t bandNoiseMeasured[BANDS];
 
-static void applyNoise(const int8_t *noise)
+static void applyNoise(const int8_t* noise, const char* source)
 {
     memcpy(bandNoiseMeasured, noise, BANDS);
     for (int b = 0; b < BANDS; b++) bandNoise[b] = noise[b] + NOISE_MARGIN_DB;
+
+    int n = snprintf(noiseStatus, sizeof(noiseStatus), "noise %s: {", source);
+    for (int b = 0; b < BANDS && n < (int)sizeof(noiseStatus); b++)
+        n += snprintf(noiseStatus + n, sizeof(noiseStatus) - n, b ? ", %d" : "%d", noise[b]);
+    if (n < (int)sizeof(noiseStatus)) snprintf(noiseStatus + n, sizeof(noiseStatus) - n, "}");
+    noiseStatusNew = true;
+    Serial.println(noiseStatus);
 }
 
 static void beginCalibration()
@@ -747,8 +803,11 @@ static void beginCalibration()
     pinMode(PIN_BUTTON_UP, INPUT_PULLUP);
     int8_t stored[BANDS];
     prefs.begin("vinyl");
-    bool have = prefs.getBytesLength("noise") == BANDS && prefs.getBytes("noise", stored, BANDS) == BANDS;
-    applyNoise(have ? stored : bandNoiseDb);
+    // a calibration only fits the band layout it was measured with
+    bool have = prefs.getUInt("layout") == NOISE_LAYOUT && prefs.getBytesLength("noise") == BANDS &&
+                prefs.getBytes("noise", stored, BANDS) == BANDS;
+    applyNoise(have ? stored : bandNoiseDb,
+               have ? "from flash" : "defaults, no calibration for these bands");
 }
 
 // returns true while calibrating, having drawn the frame
@@ -794,15 +853,10 @@ static bool updateCalibration()
     if (elapsed >= CAL_MS)
     {
         int8_t noise[BANDS];
-        Serial.print("calibrated: {");
-        for (int b = 0; b < BANDS; b++)
-        {
-            noise[b] = (int8_t)ceilf(loudest[b]);
-            Serial.printf(b ? ", %d" : "%d", noise[b]);
-        }
-        Serial.println("}");
+        for (int b = 0; b < BANDS; b++) noise[b] = (int8_t)ceilf(loudest[b]);
         prefs.putBytes("noise", noise, BANDS);
-        applyNoise(noise);
+        prefs.putUInt("layout", NOISE_LAYOUT);
+        applyNoise(noise, "calibrated");
         calibrating = false;
         return false;
     }
@@ -840,7 +894,7 @@ void setup()
     colorPeak = rgb(lilac[0], lilac[1], lilac[2]);
 
     // Log-spaced band edges. The FFT is too coarse to split the bass logarithmically,
-    // so each band takes at least one bin of its own: linear up to ~400 Hz, log above.
+    // so each band takes at least one bin of its own: linear up to ~230 Hz, log above.
     const float binHz = (float)SAMPLE_HZ / FFT_N, highHz = SAMPLE_HZ / 2.0f;
     for (int b = 0; b <= BANDS; b++)
     {

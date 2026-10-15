@@ -1,6 +1,6 @@
 # Vinyl Spectrum Analyzer: LED Rulez D00d
 
-A 32×16 LED spectrum analyzer that listens to the record player. Line-level audio is tapped after the phono preamp and run through an FFT on an Adafruit MatrixPortal S3, and the result is drawn as 16 bars on a HUB75 panel, spaced like a real analyzer: one bar per 47 Hz in the bass, widening logarithmically up to 6 kHz. The bars fade from sage to lilac, with peak dots that hang and sink.
+A 32×16 LED spectrum analyzer that listens to the record player. Line-level audio is tapped after the phono preamp and run through an FFT on an Adafruit MatrixPortal S3, and the result is drawn as 16 bars on a HUB75 panel, spaced like a real analyzer: one bar per 39 Hz in the bass, widening logarithmically up to 10 kHz. The bars fade from sage to lilac, with peak dots that hang and sink.
 
 It's a port of my earlier Arduino Uno build, [VisEQ](https://github.com/marcwingduck/viseq), which used a microphone.
 
@@ -88,7 +88,7 @@ Only built when `src/secrets.h` exists, see [Build and flash](#build-and-flash).
 
 The board joins WiFi as `vinyl-matrix.local` and listens on UDP port 4210. snapserver-lcd sends one datagram per change and repeats it every 10 s. Once on WiFi, the board broadcasts a hello, which snapserver-lcd answers right away, so a track that is already playing shows up as soon as the boot animation ends. If nothing arrives for 30 s, or a stop packet comes in, the panel returns to the spectrum. If the board never connects, the spectrum runs as before.
 
-Vinyl always wins. The ADC only hears the turntable, so any band above its noise floor switches to the spectrum straight away. The panel goes back to Spotify only after `VINYL_HOLD_MS` of silence.
+Vinyl always wins. The ADC only hears the turntable, so a band rising `VINYL_DB` (6 dB) above where its bars start switches to the spectrum straight away. The extra margin keeps wandering mains hum from taking the panel from Spotify. The panel goes back to Spotify only after `VINYL_HOLD_MS` of silence.
 
 Datagram layout (version 4). Everything after byte 3 is only sent with `P`:
 
@@ -113,7 +113,7 @@ All settings are `#define`s at the top of [src/main.cpp](src/main.cpp).
 | `bandNoiseDb` | measured | Default for each band's level with the needle up, until you calibrate with the UP button. Bars only show what rises above it, so silence stays dark and quiet passages still show. See below |
 | `NOISE_MARGIN_DB` | 6 | How far above its noise a band has to rise to show. Raise it if bars twitch with the needle up |
 | `DISPLAY_DB` | 30 | Range the bars cover below the recent loudest band. Lower it for livelier bars |
-| `SAMPLE_HZ` | 12000 | FFT sample rate, so the bars reach `SAMPLE_HZ / 2`. The ADC runs at `OVERSAMPLE` times this on its own timer (DMA), up to 83 kHz |
+| `SAMPLE_HZ` | 20000 | FFT sample rate, so the bars reach `SAMPLE_HZ / 2`. The ADC runs at `OVERSAMPLE` times this on its own timer (DMA), up to 83 kHz |
 | `OVERSAMPLE` | 4 | ADC samples averaged per FFT sample. Each doubling takes ~3 dB off random noise, not off hum |
 | `ART_GAMMA` | 2.2 | Gamma correction for the artwork. Lower it if dark covers lose detail |
 | `SCROLL_MS_PER_PX` | 70 | Marquee speed of artist and title, ~14 px/s. Rounded to whole frames (one audio block each, ~21 ms at the default `FFT_N` and `SAMPLE_HZ`) so every step is equally long |
@@ -121,7 +121,7 @@ All settings are `#define`s at the top of [src/main.cpp](src/main.cpp).
 
 The colors are the `sage` and `lilac` RGB values in `setup()`. Everything runs at full brightness: dimming in software costs color depth (dark tones flicker and posterize), so tame the panel with a tinted film or smoked acrylic in front instead.
 
-**Calibrating the noise floor:** the noise isn't even across bands. Mains hum puts 50 Hz and its harmonics well above the rest, so each band has its own floor. Calibrate wherever the board will run, since the hum depends on cables and power supply: lift the needle, then hold the **UP** button for 2 seconds. A progress bar runs for 15 seconds while each band is measured. The result is stored in flash and survives power cuts and firmware updates. Until the first calibration, the defaults in `bandNoiseDb` apply. With the needle up, `pio device monitor` should then show `above noise` around `-NOISE_MARGIN_DB`.
+**Calibrating the noise floor:** the noise isn't even across bands. Mains hum puts 50 Hz and its harmonics well above the rest, so each band has its own floor. Calibrate wherever the board will run, since the hum depends on cables and power supply: lift the needle, then hold the **UP** button for 2 seconds. A progress bar runs for 15 seconds while each band is measured. The result is stored in flash and survives power cuts and firmware updates, unless an update changes the bands (`SAMPLE_HZ`, `FFT_N`, `BAND_LOW_HZ`), which needs a new calibration. Until the first calibration, the defaults in `bandNoiseDb` apply. With the needle up, `pio device monitor` should then show `above noise` around `-NOISE_MARGIN_DB`.
 
 **Stray peaks while idle:** with WiFi set up, the board needs no cable for this. Uncomment `#define IDLE_LOG` at the top of [src/main.cpp](src/main.cpp), flash, and listen on any machine in the network (macOS `nc -ul` stops after the first line):
 
@@ -129,7 +129,7 @@ The colors are the `sage` and `lilac` RGB values in `setup()`. Everything runs a
 python3 -c 'import socket,time;s=socket.socket(2,2);s.bind(("",4211));[print(time.strftime("%H:%M:%S"),d.decode(),end="",flush=True) for _ in iter(int,1) if (d:=s.recv(512))]'
 ```
 
-Every minute the board broadcasts a heartbeat, and whenever a band rises above its noise floor while the turntable is silent, it sends one line: which band, how loud, how many frames, and how loud after the 3-frame median that hides one-frame interference. `-> SHOWN` marks the ones that made it onto the panel.
+Every minute the board broadcasts a heartbeat, and whenever a band rises above its noise floor while the turntable is silent, it sends one line: which band, how loud, how many frames, and how loud after the 3-frame median that hides one-frame interference. `-> SHOWN` marks the ones that made it onto the panel. It also reports where the noise floor came from (stored calibration or defaults) after boot and after each calibration, and every handover between Spotify and the spectrum, with the band that triggered it.
 
 ## License
 
