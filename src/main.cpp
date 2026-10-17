@@ -512,7 +512,12 @@ static void receiveNowPlaying()
     if (artistChanged || titleChanged || !np.active) t.titleSince = frames;
 
     memcpy(t.art, art, sizeof(art));
-    t.colorArtist = rgb(p[0], p[1], p[2]);
+    // the accent in the artwork's colors: gamma like the art, but brightened first so
+    // its strongest channel is full, or dark accents would make the text unreadable
+    uint8_t top = max(max(p[0], p[1]), max(p[2], (uint8_t)1));
+    uint8_t c[3];
+    for (int k = 0; k < 3; k++) c[k] = artGamma[p[k] * 255 / top];
+    t.colorArtist = rgb(c[0], c[1], c[2]);
     strlcpy(t.artist, artist, TEXT_MAX);
     strlcpy(t.title, title, TEXT_MAX);
     t.artistWidth = text.getUTF8Width(t.artist);
