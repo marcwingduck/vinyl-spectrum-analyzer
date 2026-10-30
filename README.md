@@ -90,16 +90,26 @@ The board joins WiFi as `vinyl-matrix.local` and listens on UDP port 4210. snaps
 
 Vinyl always wins. The ADC only hears the turntable, so a band rising `VINYL_DB` (6 dB) above where its bars start switches to the spectrum straight away. The extra margin keeps wandering mains hum from taking the panel from Spotify. The panel goes back to Spotify only after `VINYL_HOLD_MS` of silence.
 
-Datagram layout (version 4). Everything after byte 3 is only sent with `P`:
+Datagram layout (version 4). Everything after byte 3 is only sent with `P` and `V`:
 
 | Bytes | Content |
 |-------|---------|
 | 0–1 | `NP` |
 | 2 | version, `4` |
-| 3 | `P` show, `S` stop; `H` hello, broadcast by the board until the sender answers |
+| 3 | `P` show, `S` stop; `H` hello, broadcast by the board until the sender answers; `V` the record on the turntable, see below |
 | 4–771 | 16×16 artwork, RGB888, row-major |
 | 772–774 | accent color RGB, used for the artist line |
 | 775… | artist `\0` title `\0`, UTF-8, Latin-1 characters only |
+
+`V` has 6 more bytes before the strings: the bars' bottom and top color RGB at 775–780, all zero to keep sage and lilac. The strings start at 781.
+
+## Recognizing the record (optional)
+
+With WiFi set up, the board can tell [groove-id](../groove-id) on the snapserver Pi what's on the turntable. It fingerprints a 10 s clip against the MP3s of the records in your Discogs collection. When a new track is recognized, its cover and title slide in from the top, pushing the bars down, and after 8 s the bars push them back out. Until the turntable goes silent, the bars take the album's colors and the peaks its accent.
+
+The board decides when a clip is worth it. A needle drop counts as a new track, and so does a gap: the level falling `GAP_DB` below the recent loud level for `GAP_MS` and coming back. The groove still crackles between tracks, so the level doesn't fall all the way to the noise floor. `CLIP_DELAY_MS` into the track, the board broadcasts `clip needle` or `clip gap` on UDP port 4213. Sides that run from track to track without a gap get a `clip recheck` every `RECHECK_MS`. groove-id then connects to TCP port 4212 and gets the next 10 s as raw 16-bit mono at `SAMPLE_HZ`, 400 kB from PSRAM. The board records first, then sends `CLIP_CHUNK` bytes per frame, about 2.5 s for the whole clip. Sent in one burst, the WiFi made the panel flicker for half a second; `CLIP_CHUNK 0` brings the burst back. groove-id answers every recognition with a `V` datagram, and only a new track pops in. Once the turntable has been silent for `VINYL_HOLD_MS`, the board broadcasts `stop` on the same port, so snapserver-lcd's LCD drops the record right away instead of at the track's end.
+
+Without groove-id nothing changes: nobody fetches clips, and the broadcasts go unanswered.
 
 ## Tuning
 
@@ -115,9 +125,14 @@ All settings are `#define`s at the top of [src/main.cpp](src/main.cpp).
 | `DISPLAY_DB` | 30 | Range the bars cover below the recent loudest band. Lower it for livelier bars |
 | `SAMPLE_HZ` | 20000 | FFT sample rate, so the bars reach `SAMPLE_HZ / 2`. The ADC runs at `OVERSAMPLE` times this on its own timer (DMA), up to 83 kHz |
 | `OVERSAMPLE` | 4 | ADC samples averaged per FFT sample. Each doubling takes ~3 dB off random noise, not off hum |
-| `ART_GAMMA` | 2.2 | Gamma correction for the artwork. Lower it if dark covers lose detail |
+| `GAMMA` | 2.2 | Gamma correction for the artwork. Lower it if dark covers lose detail |
 | `SCROLL_MS_PER_PX` | 70 | Marquee speed of artist and title, ~14 px/s. Rounded to whole frames (one audio block each, ~21 ms at the default `FFT_N` and `SAMPLE_HZ`) so every step is equally long |
-| `VINYL_HOLD_MS` | 3000 | Silence needed before Spotify takes the panel back |
+| `VINYL_HOLD_MS` | 3000 | Silence needed before Spotify takes the panel back. Also ends a recognized record, so its colors go |
+| `GAP_DB` | 15 | How far the level has to fall below the recent loud level to count as a gap between tracks. Lower it to catch tracks that run into each other, at the risk of quiet passages asking for clips |
+| `GAP_MS` | 1000 | How long a gap has to last |
+| `CLIP_DELAY_MS` | 4000 | How long into a track before asking for a clip, past quiet intros |
+| `RECHECK_MS` | 120000 | Clip interval when no gap shows up, for sides without pauses |
+| `POP_MS` | 8000 | How long a recognized track stays before the bars return. Long names stretch it to `POP_MAX_MS` (15000) so they scroll through once |
 
 The colors are the `sage` and `lilac` RGB values in `setup()`. Everything runs at full brightness: dimming in software costs color depth (dark tones flicker and posterize), so tame the panel with a tinted film or smoked acrylic in front instead.
 

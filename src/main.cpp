@@ -84,6 +84,20 @@ uint32_t samplesUsed;  // FFT samples taken since the last print, to check SAMPL
 
 // one frame of DMA results, 4 bytes each
 uint8_t adcBuf[FFT_N * OVERSAMPLE * SOC_ADC_DIGI_RESULT_BYTES];
+
+#ifdef NOW_PLAYING
+// Song recognition: whoever connects to CLIP_PORT gets the next CLIP_S seconds of
+// audio as raw 16-bit mono at SAMPLE_HZ. Recorded first, then sent CLIP_CHUNK bytes per
+// frame: in one 400 kB burst the WiFi made the panel flicker for half a second.
+#define CLIP_PORT 4212
+#define CLIP_CHUNK 4096  // ~100 frames, 2.5 s; raise for a shorter send, 0 for one burst
+#define CLIP_ASK_PORT 4213  // broadcast "clip <reason>" when a clip is worth fetching
+#define CLIP_S 10
+#define CLIP_SAMPLES (CLIP_S * SAMPLE_HZ)
+int16_t* clip;                     // 400 kB, in PSRAM
+uint32_t clipPos = CLIP_SAMPLES;  // recording while below CLIP_SAMPLES
+uint32_t clipSent = 0;             // bytes of the recorded clip sent so far
+#endif
 uint8_t peaks[LED_COLS];
 uint32_t peakMillis[LED_COLS];
 float barLevel[LED_COLS];
@@ -91,6 +105,20 @@ uint32_t lastDraw = 0;
 uint32_t frames = 0;  // loop() runs, one per audio block
 
 uint16_t colorOff, colorPeak, colorRow[LED_ROWS];
+// a recognized record paints the bars in its cover's colors until the turntable stops
+bool albumColors = false;
+uint16_t albumPeak, albumRow[LED_ROWS];
+// a new track's colors wait until its pop-in has pushed the bars off the panel
+bool pendingColors = false, pendingAlbumColors;
+uint16_t pendingPeak, pendingRow[LED_ROWS];
+
+static void applyPendingColors()
+{
+    albumColors = pendingAlbumColors;
+    albumPeak = pendingPeak;
+    memcpy(albumRow, pendingRow, sizeof(albumRow));
+    pendingColors = false;
+}
 
 struct MovingAverage
 {
@@ -308,6 +336,10 @@ static void sampleAudio()
 
             vReal[n] = (float)acc / OVERSAMPLE;
             vImag[n] = 0.0f;
+#ifdef NOW_PLAYING
+            // 12 bits around mid-rail to full-scale 16 bits; the receiver filters the rest of the bias
+            if (clipPos < CLIP_SAMPLES) clip[clipPos++] = ((int)(acc / OVERSAMPLE) - 2048) * 16;
+#endif
             sum += acc / OVERSAMPLE;
             n++;
             k = 0;
@@ -361,11 +393,28 @@ static void runFFT()
     signalDb = signalAvg.add(maxSignal);
 }
 
-static void draw()
+// one color per row, bottom to top
+static void fillGradient(uint16_t* rows, const uint8_t bottom[3], const uint8_t top[3])
+{
+    for (int j = 0; j < LED_ROWS; j++)
+    {
+        uint32_t t = (uint32_t)j * 255 / (LED_ROWS - 1);
+        uint8_t c[3];
+        for (int k = 0; k < 3; k++)
+            c[k] = (bottom[k] * (255 - t) + top[k] * t) / 255;
+        rows[j] = rgb(c[0], c[1], c[2]);
+    }
+}
+
+// draws the bars shifted down by dy rows, without clearing or showing the panel;
+// runs every frame, even pushed off the panel, so the bars keep moving
+static void drawBars(int dy)
 {
     // Bars span DISPLAY_DB below the recent loudest band, but never reach into a band's
     // noise: quiet passages show whatever rises above it, silence shows nothing.
     const float scale = (float)LED_ROWS / DISPLAY_DB;
+    const uint16_t* rows = albumColors ? albumRow : colorRow;
+    const uint16_t peak = albumColors ? albumPeak : colorPeak;
 
     // time-based so the feel doesn't depend on how fast loop() runs
     uint32_t now = millis();
@@ -373,8 +422,6 @@ static void draw()
     lastDraw = now;
     float attack = 1.0f - expf(-dt / ATTACK_MS);
     float release = 1.0f - expf(-dt / RELEASE_MS);
-
-    matrix.fillScreen(colorOff);
 
     for (int i = 0; i < LED_COLS; i++)
     {
@@ -395,11 +442,16 @@ static void draw()
         }
 
         for (int j = 0; j < val; j++)
-            matrix.drawPixel(i, LED_ROWS - 1 - j, colorRow[j]);
+            matrix.drawPixel(i, LED_ROWS - 1 - j + dy, rows[j]);
 
-        if (peaks[i] > 0) matrix.drawPixel(i, LED_ROWS - peaks[i], colorPeak);
+        if (peaks[i] > 0) matrix.drawPixel(i, LED_ROWS - peaks[i] + dy, peak);
     }
+}
 
+static void draw()
+{
+    matrix.fillScreen(colorOff);
+    drawBars(0);
     matrix.show();
 }
 
@@ -415,6 +467,16 @@ static void draw()
 #define HELLO_MS 2000        // until snapserver-lcd answers, ask it for the state this often
 #define VINYL_HOLD_MS 3000   // silence needed before handing the panel to spotify
 #define VINYL_DB 6           // above the bars' floor before it counts as vinyl; hum wanders
+// A new track: the needle drops, or the level falls GAP_DB below the recent loud level
+// for GAP_MS (the groove still crackles, so not down to the floor) and comes back.
+// CLIP_DELAY_MS into the track the board asks for a clip; gapless sides every RECHECK_MS.
+#define GAP_DB 15
+#define GAP_MS 1000
+#define CLIP_DELAY_MS 4000
+#define RECHECK_MS 120000
+#define LOUD_DECAY_DB_S 2.0f  // how fast the recent loud level sinks through quiet passages
+#define POP_MS 8000           // a recognized record track shows this long before the bars return
+#define POP_MAX_MS 15000      // long names stretch it until they've scrolled through once, up to this
 #define ART_SIZE 16
 #define TEXT_MAX 128
 #define SCROLL_MS_PER_PX 70  // marquee speed, ~14 px/s
@@ -459,59 +521,40 @@ struct NowPlaying
     Track track, previous;  // previous is only drawn while it slides out
 } np;
 
+// the record on the turntable, recognized by groove-id on tape
+struct Record
+{
+    bool known = false;  // until the turntable goes silent
+    uint32_t popSince = 0, popMs = 0;  // a new track slides in, stays, then slides out
+    Track track;
+} record;
+
 WiFiUDP udp;
+WiFiServer clipServer(CLIP_PORT);
+WiFiClient clipClient;
 uint8_t packet[1200];
 uint8_t artGamma[256];
 uint32_t lastVinyl = -VINYL_HOLD_MS;  // no vinyl yet, so a track can take over right at boot
 bool mdnsStarted = false;
 bool heardFromPi = false;
 
-// Packet: "NP" version cmd, then for cmd 'P':
-// 16x16 RGB888 art (row-major), accent RGB, artist\0, title\0 (UTF-8)
-// cmd 'S' (or silence for NP_TIMEOUT_MS) ends the now playing view.
-static void receiveNowPlaying()
+// Fills t (all but the marquee starts) from a 'P' or 'V' packet of length len;
+// extra bytes sit between the accent and the artist. False if it is malformed.
+static bool readTrack(int len, int extra, Track& t)
 {
-    int len = udp.parsePacket();
-    if (len <= 0) return;
-    len = udp.read(packet, sizeof(packet));
-
     const int artBytes = ART_SIZE * ART_SIZE * 3;
-    if (len < 4 || packet[0] != 'N' || packet[1] != 'P' || packet[2] != 4) return;
-    heardFromPi = true;
-
-    if (packet[3] == 'S')
-    {
-        np.active = false;
-        return;
-    }
-    if (packet[3] != 'P' || len < 4 + artBytes + 3 + 2) return;
+    if (len < 4 + artBytes + 3 + extra + 2) return false;
 
     // both strings must be terminated inside the packet
     const uint8_t* p = packet + 4;
-    const char* artist = (const char*)p + artBytes + 3;
+    const char* artist = (const char*)p + artBytes + 3 + extra;
     const char* end = (const char*)packet + len;
     const char* title = (const char*)memchr(artist, 0, end - artist);
-    if (!title || !memchr(++title, 0, end - title)) return;
+    if (!title || !memchr(++title, 0, end - title)) return false;
 
-    uint16_t art[ART_SIZE * ART_SIZE];
     for (int i = 0; i < ART_SIZE * ART_SIZE; i++, p += 3)
-        art[i] = rgb(artGamma[p[0]], artGamma[p[1]], artGamma[p[2]]);
+        t.art[i] = rgb(artGamma[p[0]], artGamma[p[1]], artGamma[p[2]]);
 
-    // no album in the packet, but its tracks share the cover, which downscales identically
-    Track& t = np.track;
-    bool artistChanged = strncmp(artist, t.artist, TEXT_MAX);
-    bool titleChanged = strncmp(title, t.title, TEXT_MAX);
-    bool albumChanged = artistChanged || memcmp(art, t.art, sizeof(art));
-    if ((artistChanged || titleChanged) && np.visible)
-    {
-        np.previous = t;
-        np.slideFrom = albumChanged ? NowPlaying::FROM_TRACK : NowPlaying::FROM_TITLE;
-        np.slideSince = millis();
-    }
-    if (albumChanged || !np.active) t.artistSince = frames;
-    if (artistChanged || titleChanged || !np.active) t.titleSince = frames;
-
-    memcpy(t.art, art, sizeof(art));
     // the accent in the artwork's colors: gamma like the art, but brightened first so
     // its strongest channel is full, or dark accents would make the text unreadable
     uint8_t top = max(max(p[0], p[1]), max(p[2], (uint8_t)1));
@@ -522,6 +565,92 @@ static void receiveNowPlaying()
     strlcpy(t.title, title, TEXT_MAX);
     t.artistWidth = text.getUTF8Width(t.artist);
     t.titleWidth = text.getUTF8Width(t.title);
+    return true;
+}
+
+// Long names make the pop-in last until both have scrolled through once.
+static uint32_t popMs(const Track& t)
+{
+    const int area = LED_COLS - TEXT_X;
+    int widest = max(t.artistWidth, t.titleWidth);
+    uint32_t scrollMs = 0;
+    if (widest > area)
+        scrollMs = (scrollHoldFrames + (widest + SCROLL_GAP) * scrollFramesPerPx) * FRAME_MS;
+    return constrain(scrollMs, (uint32_t)POP_MS, (uint32_t)POP_MAX_MS);
+}
+
+// Packet: "NP" version cmd, then for cmd 'P' (spotify):
+// 16x16 RGB888 art (row-major), accent RGB, artist\0, title\0 (UTF-8)
+// cmd 'S' (or silence for NP_TIMEOUT_MS) ends the now playing view.
+// cmd 'V' (the record on the turntable, from groove-id) is 'P' with the bars' bottom
+// and top RGB after the accent, all zero to keep the bars' own colors. It comes with
+// every recognition; only a new track pops in.
+static void receiveNowPlaying()
+{
+    int len = udp.parsePacket();
+    if (len <= 0) return;
+    len = udp.read(packet, sizeof(packet));
+
+    if (len < 4 || packet[0] != 'N' || packet[1] != 'P' || packet[2] != 4) return;
+
+    if (packet[3] == 'V')
+    {
+        Track t;
+        if (!readTrack(len, 6, t)) return;
+        bool newTrack = !record.known || strncmp(t.artist, record.track.artist, TEXT_MAX) ||
+                        strncmp(t.title, record.track.title, TEXT_MAX);
+        if (newTrack)
+        {
+            t.artistSince = t.titleSince = frames;
+            record.track = t;
+            record.popSince = millis();
+            record.popMs = popMs(t);
+        }
+        record.known = true;
+
+        const uint8_t* bars = packet + 4 + ART_SIZE * ART_SIZE * 3 + 3;
+        pendingAlbumColors = false;
+        for (int k = 0; k < 6; k++) pendingAlbumColors |= bars[k] != 0;
+        if (pendingAlbumColors)
+        {
+            uint8_t bottom[3], top[3];
+            for (int k = 0; k < 3; k++)
+            {
+                bottom[k] = artGamma[bars[k]];
+                top[k] = artGamma[bars[3 + k]];
+            }
+            fillGradient(pendingRow, bottom, top);
+            pendingPeak = t.colorArtist;
+        }
+        // a recheck of the playing track changes nothing visible, so it applies at once
+        pendingColors = true;
+        if (!newTrack && millis() - record.popSince >= SLIDE_MS) applyPendingColors();
+        return;
+    }
+
+    heardFromPi = true;  // snapserver-lcd; groove-id doesn't answer the hello
+    if (packet[3] == 'S')
+    {
+        np.active = false;
+        return;
+    }
+    Track t;
+    if (packet[3] != 'P' || !readTrack(len, 0, t)) return;
+
+    // no album in the packet, but its tracks share the cover, which downscales identically
+    Track& current = np.track;
+    bool artistChanged = strncmp(t.artist, current.artist, TEXT_MAX);
+    bool titleChanged = strncmp(t.title, current.title, TEXT_MAX);
+    bool albumChanged = artistChanged || memcmp(t.art, current.art, sizeof(t.art));
+    if ((artistChanged || titleChanged) && np.visible)
+    {
+        np.previous = current;
+        np.slideFrom = albumChanged ? NowPlaying::FROM_TRACK : NowPlaying::FROM_TITLE;
+        np.slideSince = millis();
+    }
+    t.artistSince = albumChanged || !np.active ? frames : current.artistSince;
+    t.titleSince = artistChanged || titleChanged || !np.active ? frames : current.titleSince;
+    current = t;
 
     np.active = true;
     np.lastPacket = millis();
@@ -623,6 +752,97 @@ static void beginNowPlaying()
     WiFi.setAutoReconnect(true);
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
     udp.begin(NP_PORT);
+
+    clip = (int16_t*)ps_malloc(CLIP_SAMPLES * sizeof(int16_t));
+    if (clip) clipServer.begin();
+    else Serial.println("no PSRAM, no clips for song recognition");
+}
+
+// Takes one clip request at a time: records while the client waits, then sends.
+static void updateClip()
+{
+    if (!clip) return;
+    if (!clipClient)
+    {
+        clipClient = clipServer.accept();
+        if (clipClient) clipPos = clipSent = 0;
+        return;
+    }
+    if (clipPos < CLIP_SAMPLES) return;
+
+    const uint32_t size = CLIP_SAMPLES * sizeof(int16_t);
+    uint32_t n = CLIP_CHUNK ? min((uint32_t)CLIP_CHUNK, size - clipSent) : size - clipSent;
+    clipSent += clipClient.write((const uint8_t*)clip + clipSent, n);
+    if (clipSent >= size || !clipClient.connected()) clipClient.stop();
+}
+
+static void tellGrooveId(const char* msg)
+{
+    udp.beginPacket(WiFi.broadcastIP(), CLIP_ASK_PORT);
+    udp.write((const uint8_t*)msg, strlen(msg));
+    udp.endPacket();
+    Serial.println(msg);
+}
+
+static void askForClip(const char* reason)
+{
+    char msg[32];
+    snprintf(msg, sizeof(msg), "clip %s", reason);
+    tellGrooveId(msg);
+}
+
+// Once per frame: asks for a clip a little after each track starts, and says "stop"
+// once the turntable has gone silent, so the LCD needn't wait for the track's end.
+static void detectTrackStart(bool vinyl)
+{
+    static bool wasVinyl = false, inGap = false, starting = false;
+    static float loudDb, gapDb;
+    static uint32_t quietSince, startSince, lastAsk;
+    static const char* reason;
+    uint32_t now = millis();
+
+    if (!vinyl)
+    {
+        if (wasVinyl) tellGrooveId("stop");
+        wasVinyl = starting = false;
+        return;
+    }
+    if (!wasVinyl)
+    {
+        wasVinyl = starting = true;
+        inGap = false;
+        startSince = quietSince = now;
+        loudDb = signalDb;
+        reason = "needle";
+    }
+
+    loudDb = max(signalDb, loudDb - LOUD_DECAY_DB_S * FRAME_MS / 1000.0f);
+    if (signalDb > loudDb - GAP_DB) quietSince = now;
+    if (!inGap && now - quietSince >= GAP_MS)
+    {
+        inGap = true;
+        gapDb = signalDb;
+    }
+    if (inGap)
+    {
+        gapDb = min(gapDb, signalDb);
+        if (signalDb > gapDb + GAP_DB)  // the music is back
+        {
+            inGap = false;
+            starting = true;
+            startSince = now;
+            loudDb = signalDb;
+            reason = "gap";
+        }
+    }
+
+    if (inGap) return;
+    if (starting ? now - startSince >= CLIP_DELAY_MS : now - lastAsk >= RECHECK_MS)
+    {
+        askForClip(starting ? reason : "recheck");
+        starting = false;
+        lastAsk = now;
+    }
 }
 
 #ifdef IDLE_LOG
@@ -723,8 +943,28 @@ static void logIdle()
 }
 #endif
 
+// A new record track pushes the bars down, stays, then the bars push it back out.
+// False once it has left.
+static bool drawPopIn()
+{
+    uint32_t t = millis() - record.popSince;
+    if (pendingColors && t >= SLIDE_MS) applyPendingColors();  // the bars are off the panel now
+    if (t >= record.popMs + SLIDE_MS) return false;
+
+    int dy = LED_ROWS;
+    if (t < SLIDE_MS) dy = lroundf(slideProgress(t) * LED_ROWS);
+    else if (t >= record.popMs) dy = LED_ROWS - lroundf(slideProgress(t - record.popMs) * LED_ROWS);
+
+    matrix.fillScreen(colorOff);
+    drawBars(dy);
+    drawTrack(record.track, dy - LED_ROWS);
+    matrix.show();
+    return true;
+}
+
 // Draws the now playing view and returns true while Spotify plays and the
-// turntable is silent. The ADC only hears the turntable, so vinyl always wins.
+// turntable is silent, or while a recognized record track pops in. The ADC only
+// hears the turntable, so vinyl always wins.
 static bool updateNowPlaying()
 {
     if (!mdnsStarted && WiFi.status() == WL_CONNECTED)
@@ -744,6 +984,7 @@ static bool updateNowPlaying()
     }
 
     receiveNowPlaying();
+    updateClip();
     if (np.active && millis() - np.lastPacket > NP_TIMEOUT_MS) np.active = false;
 
     if (signalDb > VINYL_DB) lastVinyl = millis();
@@ -752,6 +993,8 @@ static bool updateNowPlaying()
 #endif
     // waits for the boot animation to finish
     bool vinyl = millis() - lastVinyl <= VINYL_HOLD_MS;
+    if (WiFi.status() == WL_CONNECTED) detectTrackStart(vinyl);
+    if (!vinyl) record.known = albumColors = pendingColors = false;  // the next record starts in the bars' own colors
     bool visible = np.active && !booting() && !vinyl;
 
     // stopped, the track slides out at the bottom like it does for a new one; vinyl
@@ -779,6 +1022,7 @@ static bool updateNowPlaying()
         drawTrack(np.track, lroundf(slideProgress(millis() - np.leaveSince) * LED_ROWS));
         matrix.show();
     }
+    if (vinyl && record.known && !ejecting() && drawPopIn()) return true;
     return visible || np.leaving;
 }
 #endif
@@ -888,14 +1132,7 @@ void setup()
     colorOff = rgb(0, 0, 0);
     // soft sage at the bottom fading into lilac on top
     const uint8_t sage[3] = {80, 200, 90}, lilac[3] = {190, 70, 255};
-    for (int j = 0; j < LED_ROWS; j++)
-    {
-        uint32_t t = (uint32_t)j * 255 / (LED_ROWS - 1);
-        uint8_t c[3];
-        for (int k = 0; k < 3; k++)
-            c[k] = (sage[k] * (255 - t) + lilac[k] * t) / 255;
-        colorRow[j] = rgb(c[0], c[1], c[2]);
-    }
+    fillGradient(colorRow, sage, lilac);
     colorPeak = rgb(lilac[0], lilac[1], lilac[2]);
 
     // Log-spaced band edges. The FFT is too coarse to split the bass logarithmically,
