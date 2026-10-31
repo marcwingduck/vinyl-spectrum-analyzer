@@ -1,5 +1,5 @@
-#include <ESP32-HUB75-MatrixPanel-I2S-DMA.h>
 #include <Arduino.h>
+#include <ESP32-HUB75-MatrixPanel-I2S-DMA.h>
 #include <Preferences.h>
 #include <arduinoFFT.h>
 #include <driver/adc.h>
@@ -42,13 +42,13 @@
 // current pulses reach the ADC: at 180 the Spotify view added 9-15 dB to the bass and mid
 // bands, the board took that for vinyl and swapped to the bars every few seconds.
 #define BRIGHTNESS 255  // 0-255
-#define DISPLAY_DB 20        // range the bars show, from the top of the scale down
+#define DISPLAY_DB 20   // range the bars show, from the top of the scale down
 // The top of the scale jumps to any louder band at once and sinks this fast after it,
 // so the loudest moment just reaches the top and nothing is cut off there (an average
 // as the top did that to every peak above it, and the bass stuck to the ceiling)
 #define SCALE_DECAY_DB_S 6
-#define MM_SIZE 32           // frames averaged for silence detection
-#define ATTACK_MS 25         // how fast bars rise to a new level
+#define MM_SIZE 32    // frames averaged for silence detection
+#define ATTACK_MS 25  // how fast bars rise to a new level
 // boot animation, one phase after the other; the reels turn and the tape winds throughout
 #define BOOT_FADE_MS 3000                                      // the cassette fades in
 #define BOOT_GLINT_MS 1000                                     // then light sweeps across it
@@ -56,8 +56,7 @@
 #define BOOT_MS (BOOT_FADE_MS + BOOT_GLINT_MS + BOOT_HOLD_MS)  // then the tape slides out
 #define REEL_STEP_MS 500
 #define SLIDE_MS 500    // pushes run this long: new album down, new title left, tape out
-#define FADE_FROM 0.5f  // fade start; much lower and colors tint, 5 bits per channel
-#define GAMMA 2.2f      // LEDs are linear, images are sRGB
+#define FADE_FROM 0.2f  // brightness the cassette fades in from, at 8 bits per channel
 #define RELEASE_MS 140  // how slowly they sink back; raise for calmer bars
 
 // MatrixPortal S3 pins (as in Adafruit's Protomatter examples):
@@ -112,7 +111,7 @@ uint8_t adcBuf[FFT_N * OVERSAMPLE * SOC_ADC_DIGI_RESULT_BYTES];
 #define CLIP_ASK_PORT 4213  // broadcast "clip <reason>" when a clip is worth fetching
 #define CLIP_S 10
 #define CLIP_SAMPLES (CLIP_S * SAMPLE_HZ)
-int16_t* clip;                     // 400 kB, in PSRAM
+int16_t* clip;                    // 400 kB, in PSRAM
 uint32_t clipPos = CLIP_SAMPLES;  // recording while below CLIP_SAMPLES
 #endif
 uint8_t peaks[LED_COLS];
@@ -121,13 +120,20 @@ float barLevel[LED_COLS];
 uint32_t lastDraw = 0;
 uint32_t frames = 0;  // loop() runs, one per audio block
 
-uint16_t colorOff, colorPeak, colorRow[LED_ROWS];
+// Everything drawn pixel by pixel is 8 bits per channel, the library's own depth; only
+// the text and filled rectangles (Adafruit GFX, U8g2) take RGB565, through rgb().
+struct Rgb
+{
+    uint8_t r, g, b;
+};
+
+Rgb colorPeak, colorRow[LED_ROWS];
 // a recognized record paints the bars in its cover's colors until the turntable stops
 bool albumColors = false;
-uint16_t albumPeak, albumRow[LED_ROWS];
+Rgb albumPeak, albumRow[LED_ROWS];
 // a new track's colors wait until its pop-in has pushed the bars off the panel
 bool pendingColors = false, pendingAlbumColors;
-uint16_t pendingPeak, pendingRow[LED_ROWS];
+Rgb pendingPeak, pendingRow[LED_ROWS];
 
 static void applyPendingColors()
 {
@@ -155,42 +161,44 @@ struct MovingAverage
 
 MovingAverage signalAvg;
 float peakDb = -1e9f;  // the top of the bar scale: the loudest band, sinking SCALE_DECAY_DB_S after it
-float signalDb;  // recent loudest band relative to its noise floor; > 0 means audio
+float signalDb;        // recent loudest band relative to its noise floor; > 0 means audio
 
-// RGB565 gives green one bit more than red and blue, so dark grays would light
-// only the green LED. Quantizing all three to 5 bits keeps darks neutral.
+// RGB565 for the text and rectangles. It gives green one bit more than red and blue,
+// so dark grays would light only the green LED; quantizing all three to 5 bits keeps
+// darks neutral.
 static uint16_t rgb(uint8_t r, uint8_t g, uint8_t b)
 {
     return (r >> 3 << 11) | (g >> 3 << 6) | (b >> 3);
 }
+static uint16_t rgb(Rgb c) { return rgb(c.r, c.g, c.b); }
 
 // boot screen: '.' is off, letters index cassettePalette; lit from the top left
 static const char* const cassette[LED_ROWS] = {
-    ".....EEEEEEEEEEEEEEEEEEEEEE.....",
-    "....EGAAAAAAAAAAAAAAAAAAAAGF....",
-    "....EAABBBBBBBBBBBBBBBBBBAAF....",
-    "....EABBBBBBBBBBBBBBBBBBBBAF....",
-    "....EABBBBBBBBBBBBBBBBBBBBAF....",
-    "....EABBBAAAAAAAAAAAAAABBBAF....",
-    "....EABBBACCADDDDDDACCABBBAF....",
-    "....EABBBACCADDDDDDACCABBBAF....",
-    "....EABBBAAAAAAAAAAAAAABBBAF....",
-    "....EABBBBBBBBBBBBBBBBBBBBAF....",
-    "....EABBBBBBBBBBBBBBBBBBBBAF....",
-    "....EAAAAEEEEEEEEEEEEEEAAAAF....",
-    "....EAAAEAAAAAAAAAAAAAAFAAAF....",
-    "....EAAAEAAA.AAAAAA.AAAFAAAF....",
-    "....EGAEAA.AAAAAAAAAA.AAFAGF....",
-    ".....FFEFFFFFFFFFFFFFFFFFFF.....",
+    ".....BBBBBBBBBBBBBBBBBBBBBB.....",
+    "....BGAAAAAAAAAAAAAAAAAAAAGC....",
+    "....BAADDDDDDDDDDDDDDDDDDAAC....",
+    "....BADDDDDDDDDDDDDDDDDDDDAC....",
+    "....BADDDDDDDDDDDDDDDDDDDDAC....",
+    "....BADDDAAAAAAAAAAAAAADDDAC....",
+    "....BADDDAFFAEEEEEEAFFADDDAC....",
+    "....BADDDAFFAEEEEEEAFFADDDAC....",
+    "....BADDDAAAAAAAAAAAAAADDDAC....",
+    "....BADDDDDDDDDDDDDDDDDDDDAC....",
+    "....BADDDDDDDDDDDDDDDDDDDDAC....",
+    "....BAAAABBBBBBBBBBBBBBAAAAC....",
+    "....BAAABAAAAAAAAAAAAAACAAAC....",
+    "....BAAABAAA.AAAAAA.AAACAAAC....",
+    "....BGABAA.AAAAAAAAAA.AACAGC....",
+    ".....CCBCCCCCCCCCCCCCCCCCCC.....",
 };
 static const uint8_t cassettePalette[][3] = {
-    {100, 100, 100},  // A shell
-    {190, 70, 255},   // B label
-    {255, 255, 255},  // C reel hubs
-    {60, 40, 80},     // D window, smoked; the tape shows through
-    {255, 255, 255},  // E shell, lit edge
-    {64, 64, 64},     // F shell, shadow edge; LEDs lift darks, so go deep
-    {16, 16, 16},     // G screw
+    {128, 128, 128},  // A shell
+    {255, 255, 255},  // B shell, lit edge
+    {64, 64, 64},     // C shell, shadow edge
+    {190, 70, 255},   // D label
+    {0, 0, 0},        // E window
+    {255, 255, 255},  // F reel hubs
+    {32, 32, 32},     // G screws
 };
 static const int cassetteColorCount = sizeof(cassettePalette) / 3;
 static const float glintShine[] = {0.0f, 0.45f, 0.85f};  // blend toward white: none, edge, core
@@ -212,21 +220,19 @@ static float slideProgress(uint32_t elapsed)
     return 1.0f - p * p;
 }
 
-static uint16_t cassetteColor(const uint8_t color[3], float level, float shine)
+// full 8 bits per channel: through rgb()'s 5 bits the fade crept up in visible steps
+static Rgb cassetteColor(const uint8_t color[3], float level, float shine)
 {
     uint8_t c[3];
     for (int k = 0; k < 3; k++)
     {
         float v = color[k] + (255 - color[k]) * shine;
-        // rgb() drops the low 3 bits; round to the nearest step instead, or dim
-        // channels lose more than bright ones and faded colors shift hue (tape goes red)
-        int q = min(lroundf(powf(v * level / 255.0f, GAMMA) * 255) + 4, 255L);
-        // keep dim channels lit so the shadow edges don't pop in late and the
-        // cassette doesn't seem to grow
-        c[k] = v > 0 ? max(q, 8) : q;
+        c[k] = (uint8_t)lroundf(v * level);
     }
-    return rgb(c[0], c[1], c[2]);
+    return {c[0], c[1], c[2]};
 }
+
+static void drawRgb(int x, int y, Rgb c) { matrix.drawPixelRGB888(x, y, c.r, c.g, c.b); }
 
 // how much of pixel (x, y) a tape pack of radius r around (cx, cy) covers, 0..1;
 // the partly covered edge pixel lets the pack grow smoothly
@@ -247,12 +253,12 @@ static float packCoverage(int x, int y, float cx, float cy, float r)
 // as they do when the tape runs left to right past the head
 static void drawCassette(int dy)
 {
-    // fade in step by step with the reels; scaled before gamma, so it looks even
+    // fades in smoothly, scaled before the library's curve so it looks even; the reels
+    // turn in steps
     uint32_t elapsed = bootElapsed();
     int step = elapsed / REEL_STEP_MS;
-    const int fadeSteps = BOOT_FADE_MS / REEL_STEP_MS;
-    float level = FADE_FROM + (1.0f - FADE_FROM) * min(step, fadeSteps) / fadeSteps;
-    uint16_t colors[3][cassetteColorCount];
+    float level = FADE_FROM + (1.0f - FADE_FROM) * min(elapsed, (uint32_t)BOOT_FADE_MS) / BOOT_FADE_MS;
+    Rgb colors[3][cassetteColorCount];
     for (int s = 0; s < 3; s++)
         for (int i = 0; i < cassetteColorCount; i++)
             colors[s][i] = cassetteColor(cassettePalette[i], level, glintShine[s]);
@@ -281,7 +287,7 @@ static void drawCassette(int dy)
             if (c == '.') continue;
             int d = abs(2 * x + y - glint), shine = d < 2 ? 2 : d < 4 ? 1
                                                                       : 0;
-            if (c == 'D')
+            if (c == 'E')
             {
                 float cover = 0.0f;
                 for (int r = 0; r < 2; r++) cover = max(cover, packCoverage(x, y, reelX[r] + 1.0f, hubY, radius[r]));
@@ -290,18 +296,18 @@ static void drawCassette(int dy)
                     // the pack's edge pixel blends into the window by how much it covers
                     uint8_t mixed[3];
                     for (int k = 0; k < 3; k++)
-                        mixed[k] = lroundf(cassettePalette['D' - 'A'][k] + (tapeColor[k] - cassettePalette['D' - 'A'][k]) * cover);
-                    matrix.drawPixel(x, y + dy, cassetteColor(mixed, level, glintShine[shine]));
+                        mixed[k] = lroundf(cassettePalette['E' - 'A'][k] + (tapeColor[k] - cassettePalette['E' - 'A'][k]) * cover);
+                    drawRgb(x, y + dy, cassetteColor(mixed, level, glintShine[shine]));
                     continue;
                 }
             }
-            matrix.drawPixel(x, y + dy, colors[c == 'G' ? 0 : shine][c - 'A']);
+            drawRgb(x, y + dy, colors[c == 'G' ? 0 : shine][c - 'A']);
         }
 
     // one dark pixel circling each hub reads as rotation: top left, bottom left, ...
     static const uint8_t dx[] = {0, 0, 1, 1}, dyHub[] = {0, 1, 1, 0};
     int phase = step % 4;
-    for (int x : reelX) matrix.drawPixel(x + dx[phase], reelY + dyHub[phase] + dy, colorOff);
+    for (int x : reelX) drawRgb(x + dx[phase], reelY + dyHub[phase] + dy, {0, 0, 0});
 }
 
 // The ADC samples on its own timer at SAMPLE_HZ * OVERSAMPLE and DMA collects the
@@ -412,7 +418,7 @@ static void runFFT()
 }
 
 // one color per row, bottom to top
-static void fillGradient(uint16_t* rows, const uint8_t bottom[3], const uint8_t top[3])
+static void fillGradient(Rgb* rows, const uint8_t bottom[3], const uint8_t top[3])
 {
     for (int j = 0; j < LED_ROWS; j++)
     {
@@ -420,7 +426,7 @@ static void fillGradient(uint16_t* rows, const uint8_t bottom[3], const uint8_t 
         uint8_t c[3];
         for (int k = 0; k < 3; k++)
             c[k] = (bottom[k] * (255 - t) + top[k] * t) / 255;
-        rows[j] = rgb(c[0], c[1], c[2]);
+        rows[j] = {c[0], c[1], c[2]};
     }
 }
 
@@ -432,8 +438,8 @@ static void drawBars(int dy)
     // noise: quiet passages show whatever rises above it, silence shows nothing.
     const float scale = (float)LED_ROWS / DISPLAY_DB;
     const float top = peakDb;
-    const uint16_t* rows = albumColors ? albumRow : colorRow;
-    const uint16_t peak = albumColors ? albumPeak : colorPeak;
+    const Rgb* rows = albumColors ? albumRow : colorRow;
+    const Rgb peak = albumColors ? albumPeak : colorPeak;
 
     // time-based so the feel doesn't depend on how fast loop() runs
     uint32_t now = millis();
@@ -461,15 +467,15 @@ static void drawBars(int dy)
         }
 
         for (int j = 0; j < val; j++)
-            matrix.drawPixel(i, LED_ROWS - 1 - j + dy, rows[j]);
+            drawRgb(i, LED_ROWS - 1 - j + dy, rows[j]);
 
-        if (peaks[i] > 0) matrix.drawPixel(i, LED_ROWS - peaks[i] + dy, peak);
+        if (peaks[i] > 0) drawRgb(i, LED_ROWS - peaks[i] + dy, peak);
     }
 }
 
 static void draw()
 {
-    matrix.fillScreen(colorOff);
+    matrix.clearScreen();
     drawBars(0);
     show();
 }
@@ -520,8 +526,9 @@ U8G2_FOR_ADAFRUIT_GFX text;
 struct Track
 {
     uint32_t artistSince, titleSince;  // marquee starts, in frames
-    uint16_t art[ART_SIZE * ART_SIZE];
-    uint16_t colorArtist;
+    Rgb art[ART_SIZE * ART_SIZE];
+    Rgb accent;            // the artist's color, also the album's peaks
+    uint16_t colorArtist;  // the same as RGB565, for the text
     char artist[TEXT_MAX], title[TEXT_MAX];
     int artistWidth, titleWidth;  // in px
 };
@@ -551,7 +558,7 @@ static int vinylThreshold() { return np.visible || np.leaving ? VINYL_OVER_SPOTI
 // the record on the turntable, recognized by groove-id on tape
 struct Record
 {
-    bool known = false;  // until the turntable goes silent
+    bool known = false;                // until the turntable goes silent
     uint32_t popSince = 0, popMs = 0;  // a new track slides in, stays, then slides out
     Track track;
 } record;
@@ -561,7 +568,6 @@ WiFiServer clipServer(CLIP_PORT);
 WiFiClient clipClient;
 volatile bool clipSending = false;  // sendClip() owns clipClient until it clears this
 uint8_t packet[1200];
-uint8_t artGamma[256];
 uint32_t lastVinyl = -VINYL_HOLD_MS;  // no vinyl yet, so a track can take over right at boot
 bool mdnsStarted = false;
 bool heardFromPi = false;
@@ -581,14 +587,15 @@ static bool readTrack(int len, int extra, Track& t)
     if (!title || !memchr(++title, 0, end - title)) return false;
 
     for (int i = 0; i < ART_SIZE * ART_SIZE; i++, p += 3)
-        t.art[i] = rgb(artGamma[p[0]], artGamma[p[1]], artGamma[p[2]]);
+        t.art[i] = {p[0], p[1], p[2]};
 
-    // the accent in the artwork's colors: gamma like the art, but brightened first so
-    // its strongest channel is full, or dark accents would make the text unreadable
+    // the accent in the artwork's colors, brightened so its strongest channel is full,
+    // or dark accents would make the text unreadable
     uint8_t top = max(max(p[0], p[1]), max(p[2], (uint8_t)1));
     uint8_t c[3];
-    for (int k = 0; k < 3; k++) c[k] = artGamma[p[k] * 255 / top];
-    t.colorArtist = rgb(c[0], c[1], c[2]);
+    for (int k = 0; k < 3; k++) c[k] = p[k] * 255 / top;
+    t.accent = {c[0], c[1], c[2]};
+    t.colorArtist = rgb(t.accent);
     strlcpy(t.artist, artist, TEXT_MAX);
     strlcpy(t.title, title, TEXT_MAX);
     t.artistWidth = text.getUTF8Width(t.artist);
@@ -644,11 +651,11 @@ static void receiveNowPlaying()
             uint8_t bottom[3], top[3];
             for (int k = 0; k < 3; k++)
             {
-                bottom[k] = artGamma[bars[k]];
-                top[k] = artGamma[bars[3 + k]];
+                bottom[k] = bars[k];
+                top[k] = bars[3 + k];
             }
             fillGradient(pendingRow, bottom, top);
-            pendingPeak = t.colorArtist;
+            pendingPeak = t.accent;
         }
         // a recheck of the playing track changes nothing visible, so it applies at once
         pendingColors = true;
@@ -716,10 +723,10 @@ static void drawTitle(const Track& t, int dx, int dy)
 // the gap and artwork go last so they cover text scrolling out to the left
 static void drawArt(const Track& t, int dy)
 {
-    matrix.fillRect(ART_SIZE, dy, TEXT_X - ART_SIZE, LED_ROWS, colorOff);
+    matrix.fillRect(ART_SIZE, dy, TEXT_X - ART_SIZE, LED_ROWS, 0);
     for (int y = 0; y < ART_SIZE; y++)
         for (int x = 0; x < ART_SIZE; x++)
-            matrix.drawPixel(x, y + dy, t.art[y * ART_SIZE + x]);
+            drawRgb(x, y + dy, t.art[y * ART_SIZE + x]);
 }
 
 // draws a track shifted down by dy rows; whatever leaves the panel is clipped
@@ -732,7 +739,7 @@ static void drawTrack(const Track& t, int dy)
 
 static void drawNowPlaying()
 {
-    matrix.fillScreen(colorOff);
+    matrix.clearScreen();
 
     uint32_t elapsed = millis() - np.slideSince;
     if (elapsed < SLIDE_MS)
@@ -746,7 +753,7 @@ static void drawNowPlaying()
             drawArtist(np.track, 0);
             drawTitle(np.previous, edge - LED_COLS, 0);
             // a long old title would run on under the new one
-            matrix.fillRect(edge, ARTIST_BASELINE + 1, LED_COLS - edge, LED_ROWS, colorOff);
+            matrix.fillRect(edge, ARTIST_BASELINE + 1, LED_COLS - edge, LED_ROWS, 0);
             drawTitle(np.track, edge - TEXT_X, 0);
             drawArt(np.track, 0);
         }
@@ -768,9 +775,6 @@ static void drawNowPlaying()
 
 static void beginNowPlaying()
 {
-    for (int i = 0; i < 256; i++)
-        artGamma[i] = (uint8_t)lroundf(powf(i / 255.0f, GAMMA) * 255);
-
     text.begin(matrix);
     text.setFont(u8g2_font_tom_thumb_4x6_tf);  // smallest readable: 4 px per character, Latin-1
     text.setFontMode(1);                       // transparent background
@@ -782,8 +786,10 @@ static void beginNowPlaying()
     udp.begin(NP_PORT);
 
     clip = (int16_t*)ps_malloc(CLIP_SAMPLES * sizeof(int16_t));
-    if (clip) clipServer.begin();
-    else Serial.println("no PSRAM, no clips for song recognition");
+    if (clip)
+        clipServer.begin();
+    else
+        Serial.println("no PSRAM, no clips for song recognition");
 }
 
 // Takes one clip request at a time: records while the client waits, then sends.
@@ -993,10 +999,12 @@ static bool drawPopIn()
     if (t >= record.popMs + SLIDE_MS) return false;
 
     int dy = LED_ROWS;
-    if (t < SLIDE_MS) dy = lroundf(slideProgress(t) * LED_ROWS);
-    else if (t >= record.popMs) dy = LED_ROWS - lroundf(slideProgress(t - record.popMs) * LED_ROWS);
+    if (t < SLIDE_MS)
+        dy = lroundf(slideProgress(t) * LED_ROWS);
+    else if (t >= record.popMs)
+        dy = LED_ROWS - lroundf(slideProgress(t - record.popMs) * LED_ROWS);
 
-    matrix.fillScreen(colorOff);
+    matrix.clearScreen();
     drawBars(dy);
     drawTrack(record.track, dy - LED_ROWS);
     show();
@@ -1059,7 +1067,7 @@ static bool updateNowPlaying()
     if (visible) drawNowPlaying();
     if (np.leaving)
     {
-        matrix.fillScreen(colorOff);
+        matrix.clearScreen();
         drawTrack(np.track, lroundf(slideProgress(millis() - np.leaveSince) * LED_ROWS));
         show();
     }
@@ -1152,8 +1160,8 @@ static bool updateCalibration()
     }
 
     // progress bar across the middle rows
-    matrix.fillScreen(colorOff);
-    matrix.fillRect(0, LED_ROWS / 2 - 1, LED_COLS * elapsed / CAL_MS + 1, 2, colorPeak);
+    matrix.clearScreen();
+    matrix.fillRect(0, LED_ROWS / 2 - 1, LED_COLS * elapsed / CAL_MS + 1, 2, rgb(colorPeak));
     show();
     return true;
 }
@@ -1174,7 +1182,7 @@ void setup()
 #ifdef PANEL_TEST
     // a still image to check the panel mapping: white border, red top left, green top
     // right, blue bottom left, yellow bottom right, a diagonal from the top left
-    matrix.fillScreen(0);
+    matrix.clearScreen();
     matrix.drawRect(0, 0, LED_COLS, LED_ROWS, rgb(255, 255, 255));
     for (int i = 0; i < LED_ROWS; i++) matrix.drawPixel(i, i, rgb(0, 160, 255));
     matrix.drawPixel(0, 0, rgb(255, 0, 0));
@@ -1185,11 +1193,10 @@ void setup()
     while (1) delay(1000);
 #endif
 
-    colorOff = rgb(0, 0, 0);
     // soft sage at the bottom fading into lilac on top
-    const uint8_t sage[3] = {80, 200, 90}, lilac[3] = {190, 70, 255};
+    const uint8_t sage[3] = {185, 233, 189}, lilac[3] = {229, 181, 255};
     fillGradient(colorRow, sage, lilac);
-    colorPeak = rgb(lilac[0], lilac[1], lilac[2]);
+    colorPeak = {lilac[0], lilac[1], lilac[2]};
 
     // Log-spaced band edges. The FFT is too coarse to split the bass logarithmically,
     // so each band takes at least one bin of its own: linear up to ~230 Hz, log above.
@@ -1247,7 +1254,7 @@ void loop()
     if (ejecting())
     {
         int dy = booting() ? 0 : lroundf(slideProgress(bootElapsed() - BOOT_MS) * LED_ROWS);
-        matrix.fillScreen(colorOff);
+        matrix.clearScreen();
         drawCassette(dy);
         show();
         cassetteShown = true;

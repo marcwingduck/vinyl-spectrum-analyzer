@@ -126,7 +126,6 @@ All settings are `#define`s at the top of [src/main.cpp](src/main.cpp).
 | `SCALE_DECAY_DB_S` | 6 | The top of the scale follows the loudest band: up at once, down this fast. The loudest moment just reaches the top, and nothing is cut off there. Slower keeps the bars lower after a loud hit; faster brings them back up sooner. An average as the top (the old way) cut off every peak above it, so the bass bands stuck to the ceiling |
 | `SAMPLE_HZ` | 20000 | FFT sample rate, so the bars reach `SAMPLE_HZ / 2`. The ADC runs at `OVERSAMPLE` times this on its own timer (DMA), up to 83 kHz |
 | `OVERSAMPLE` | 4 | ADC samples averaged per FFT sample. Each doubling takes ~3 dB off random noise, not off hum |
-| `GAMMA` | 2.2 | Gamma correction for the artwork. Lower it if dark covers lose detail |
 | `SCROLL_MS_PER_PX` | 70 | Marquee speed of artist and title, ~14 px/s. Rounded to whole frames (one audio block each, ~21 ms at the default `FFT_N` and `SAMPLE_HZ`) so every step is equally long |
 | `VINYL_HOLD_MS` | 3000 | Silence needed before Spotify takes the panel back. Also ends a recognized record, so its colors go |
 | `GAP_DB` | 15 | How far the level has to fall below the recent loud level to count as a gap between tracks. Lower it to catch tracks that run into each other, at the risk of quiet passages asking for clips |
