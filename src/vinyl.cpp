@@ -37,9 +37,11 @@ void drawRecord(int x0, Rgb label, float turnDeg, float level)
         for (int x = 0; x < RECORD_SIZE; x++)
         {
             float d = dist[y][x], a = angle[y][x];
-            if (d > r || d < 1.0f) continue;  // outside, or the spindle hole
+            if (d > r) continue;
             Rgb c;
-            if (d < 3.2f)
+            if (d < 1.0f)
+                c = {0, 0, 0};  // the spindle hole, dark rather than showing what's behind
+            else if (d < 3.2f)
             {
                 float dx = x + 0.5f - RECORD_SIZE / 2, dy = y + 0.5f - RECORD_SIZE / 2;
                 c = printed(dx * turnCos - dy * turnSin, dx * turnSin + dy * turnCos) ? print : label;

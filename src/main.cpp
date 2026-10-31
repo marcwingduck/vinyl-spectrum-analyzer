@@ -121,7 +121,7 @@ Rgb colorPeak, colorRow[LED_ROWS];
 // a recognized record paints the bars in its cover's colors until the turntable stops
 bool albumColors = false;
 Rgb albumPeak, albumRow[LED_ROWS];
-// a new track's colors wait until its cover hides the bars
+// a new track's colors come in with its cover, painted over the bars as it comes down
 bool pendingColors = false, pendingAlbumColors;
 Rgb pendingPeak, pendingRow[LED_ROWS];
 
@@ -289,8 +289,10 @@ static void fillGradient(Rgb* rows, const uint8_t bottom[3], const uint8_t top[3
 }
 
 // draws the bars shifted down by dy rows, without clearing or showing the panel;
-// runs every frame, even pushed off the panel, so the bars keep moving
-static void drawBars(int dy)
+// runs every frame, even pushed off the panel, so the bars keep moving. Rows above newAbove
+// already take a new track's colors, as a cover coming down paints over them; grow draws them
+// at that share of their height, as they rise back in.
+static void drawBars(int dy, int newAbove = 0, float grow = 1.0f)
 {
     // Bars span DISPLAY_DB below the top of the scale, but never reach into a band's
     // noise: quiet passages show whatever rises above it, silence shows nothing.
@@ -298,6 +300,8 @@ static void drawBars(int dy)
     const float top = peakDb;
     const Rgb* rows = albumColors ? albumRow : colorRow;
     const Rgb peak = albumColors ? albumPeak : colorPeak;
+    const Rgb* newRows = !pendingColors ? rows : pendingAlbumColors ? pendingRow : colorRow;
+    const Rgb newPeak = !pendingColors ? peak : pendingAlbumColors ? pendingPeak : colorPeak;
 
     // time-based so the feel doesn't depend on how fast loop() runs
     uint32_t now = millis();
@@ -324,10 +328,15 @@ static void drawBars(int dy)
             peaks[i] -= 1;
         }
 
-        for (int j = 0; j < val; j++)
-            drawRgb(i, LED_ROWS - 1 - j + dy, rows[j]);
+        int shown = lroundf(val * grow), peakShown = lroundf(peaks[i] * grow);
+        for (int j = 0; j < shown; j++)
+        {
+            int y = LED_ROWS - 1 - j + dy;
+            drawRgb(i, y, y < newAbove ? newRows[j] : rows[j]);
+        }
 
-        if (peaks[i] > 0) drawRgb(i, LED_ROWS - peaks[i] + dy, peak);
+        int y = LED_ROWS - peakShown + dy;
+        if (peakShown > 0) drawRgb(i, y, y < newAbove ? newPeak : peak);
     }
 }
 
@@ -363,9 +372,9 @@ static void draw()
 #define CLIP_DELAY_MS 4000
 #define RECHECK_MS 120000
 #define LOUD_DECAY_DB_S 2.0f  // how fast the recent loud level sinks through quiet passages
-// A new record track's intro: its cover slides in over the bars' right half (SLIDE_MS), rests
-// there (SLEEVE_HOLD_MS), is pulled left over the rest to its place, revealing the record
-// (PULL_MS) and the record turns (SPIN_MS). Then the names come in from the right, pushing the
+// A new record track's intro: its cover slides in on the left, over the bars (SLIDE_MS), rests
+// there (SLEEVE_HOLD_MS), the record is pulled out of it to the right, over the bars (PULL_MS),
+// and turns (SPIN_MS). Then the names come in from the right, pushing the
 // record over the cover; they stop in their place, the record glides on and off the panel
 // (MOVE_MS). They stay at least POP_MS and scroll through NAME_CYCLES times; the last time
 // they don't come back from the right but push the cover out to the left, and the bars take
@@ -376,6 +385,7 @@ static void draw()
 #define PULL_MS 700
 #define SPIN_MS 2100
 #define MOVE_MS 1800
+#define BARS_IN_MS 800  // the bars rise back from nothing as the names leave, rather than snap in
 #define RECORD_DEG_PER_MS (33.333f * 360 / 60000)  // 33 1/3 rpm
 #define ART_SIZE 16
 #define TEXT_MAX 128
@@ -440,7 +450,11 @@ struct Record
 
 // when each step of a new record track's intro starts, from popSince; from spinAt the
 // cover hides the bars
-static const uint32_t pullAt = SLIDE_MS + SLEEVE_HOLD_MS, spinAt = pullAt + PULL_MS;
+static const uint32_t pullAt = SLIDE_MS + SLEEVE_HOLD_MS, spinAt = pullAt + PULL_MS, pushAt = spinAt + SPIN_MS;
+
+// when a new track's names are in place: after the record's intro, or after the slide-in for
+// the next track of the same record
+static uint32_t namesInAt() { return record.spins ? pushAt + MOVE_MS : SLIDE_MS; }
 
 WiFiUDP udp;
 WiFiServer clipServer(CLIP_PORT);
@@ -537,7 +551,7 @@ static void receiveNowPlaying()
         }
         // a recheck of the playing track changes nothing visible, so it applies at once
         pendingColors = true;
-        if (!newTrack && millis() - record.popSince >= spinAt) applyPendingColors();
+        if (!newTrack && millis() - record.popSince >= SLIDE_MS) applyPendingColors();
         return;
     }
 
@@ -894,21 +908,21 @@ static void drawOutlined(const char* s, int x, int baseline, uint16_t color)
     text.drawUTF8(x, baseline, s);
 }
 
-// A new record track: its cover slides in over the bars' right half while they go on in the
-// left, is pulled left over them, revealing the turning record, and the names come in,
-// pushing the record over the cover and off the panel. The next track of the same record
+// A new record track: its cover comes down in its place on the left while the bars go on in
+// the right, the turning record is pulled out of it over them, and the names come in, pushing
+// the record over the cover and off the panel. The next track of the same record
 // slides in from the top instead, pushing the bars down, like any new track. The names scroll
-// through; the last time the bars come back at once, the names shadowed over them, and they
+// through; the last time the bars rise back in, the names shadowed over them, and they
 // push the cover out to the left. False once it has gone.
 static bool drawPopIn()
 {
     uint32_t t = millis() - record.popSince;
-    if (pendingColors && t >= spinAt) applyPendingColors();  // the cover hides the bars by now
+    const uint32_t introMs = namesInAt();
+    // the cover has come down, painting the bars in the new colors on its way (or, for the
+    // next track of the same record, pushed them off the panel)
+    if (pendingColors && t >= SLIDE_MS) applyPendingColors();
 
     Track& track = record.track;
-    // the record turns until pushAt and the names push it out until introMs; the next track of
-    // the same record just slides in from the top like any new track
-    const uint32_t pushAt = spinAt + SPIN_MS, introMs = record.spins ? pushAt + MOVE_MS : SLIDE_MS;
     // both names scroll through together, the shorter one waiting for the longer
     const uint32_t cycle = max(scrollFrames(track.artistWidth), scrollFrames(track.titleWidth));
     if (t >= introMs && !record.namesIn)  // the names are in: they start scrolling now
@@ -928,7 +942,7 @@ static bool drawPopIn()
         uint32_t f = frames - record.exitFrame;
         int offset = f > scrollHoldFrames ? (f - scrollHoldFrames) / scrollFramesPerPx : 0;
         if (offset > TEXT_X + max(track.artistWidth, track.titleWidth)) return false;  // outline included
-        drawBars(0);
+        drawBars(0, 0, easeOut(f * FRAME_MS / BARS_IN_MS));  // rising back in during the pause
         drawOutlined(track.artist, TEXT_X - offset, ARTIST_BASELINE, track.colorArtist);
         drawOutlined(track.title, TEXT_X - offset, TITLE_BASELINE, rgb(255, 255, 255));
         drawCover(track, -offset, 0);
@@ -946,30 +960,32 @@ static bool drawPopIn()
         drawBars(dy);
         drawTrack(track, dy - LED_ROWS);
     }
-    else if (t < pullAt)  // the cover comes down over the bars' right half
+    else if (t < pullAt)  // the cover comes down in its place on the left, over the bars
     {
-        drawBars(0);
-        drawCover(track, RECORD_X, lroundf(slideProgress(t) * LED_ROWS) - LED_ROWS);
+        int bottom = lroundf(slideProgress(t) * LED_ROWS);  // the cover's lower edge
+        drawBars(0, bottom);  // above it, the bars already have the new colors
+        drawCover(track, 0, bottom - LED_ROWS);
     }
-    else if (t < pushAt)  // the record, the cover pulled off it over the bars
+    else if (t < pushAt)  // the record is pulled out of it to the right, over the bars, and turns
     {
-        drawBars(0);  // still showing left of the cover while it's pulled over them
-        fillRect(RECORD_X, 0, RECORD_SIZE, LED_ROWS, 0);  // the record's corners are dark, not bars
-        drawRecord(RECORD_X, track.accent, (t - pullAt) * RECORD_DEG_PER_MS, 1.0f);
-        drawCover(track, RECORD_X - lroundf(easeOut((t - pullAt) / (float)PULL_MS) * RECORD_X), 0);
+        drawBars(0);  // they go on in the record's corners
+        drawRecord(lroundf(easeOut((t - pullAt) / (float)PULL_MS) * RECORD_X), track.accent,
+                   (t - pullAt) * RECORD_DEG_PER_MS, 1.0f);
+        drawCover(track, 0, 0);  // over the record: it comes out from inside
     }
     else  // the names push the record over the cover, it glides on and off the panel
     {
-        drawBars(LED_ROWS);  // off the panel, but they keep moving
+        drawBars(0);  // until the names, with their dark ground, cover them
         // one eased move for the record, from its place until it's off the panel: a gentle start
         // so the push doesn't rush; the names keep to its right edge until they reach theirs,
         // about halfway, then it glides on and slows down
         int recordX = RECORD_X - lroundf(easeInOut((t - pushAt) / (float)MOVE_MS) * (RECORD_X + RECORD_SIZE));
         int dx = max(recordX + RECORD_SIZE - TEXT_X, 0);
+        fillRect(ART_SIZE + dx, 0, LED_COLS, LED_ROWS, 0);  // the names' ground, the gap column included
         drawArtist(track, dx, 0, cycle);
         drawTitle(track, dx, 0, cycle);
-        drawArt(track, 0);
-        // on top, only its round part: the cover shows around it and through the spindle hole
+        drawCover(track, 0, 0);
+        // on top, only its round part: the cover shows around it
         drawRecord(recordX, track.accent, (t - pullAt) * RECORD_DEG_PER_MS, 1.0f);
     }
     show();
