@@ -36,7 +36,7 @@
 
 #define PEAK_FALLOFF_MS 500  // how long a peak marker hangs before sinking
 #define NOISE_MARGIN_DB 6    // bars start this far above each band's measured noise
-#define CAL_HOLD_MS 2000     // hold the UP button this long to calibrate, with the needle up
+#define CAL_HOLD_MS 2000     // hold the DOWN button this long to calibrate, with the needle up
 #define CAL_MS 16000         // calibration measures this long, keeping each band's loudest second;
                              // whole seconds that divide LED_COLS, so each step grows the bars equally
 #define CAL_INTRO_MS 1000    // the previous calibration shows this long before the first second
@@ -1059,7 +1059,7 @@ static bool updateNowPlaying()
 }
 #endif
 
-// Calibration: hold UP with the needle up. After the previous calibration for CAL_INTRO_MS
+// Calibration: hold DOWN with the needle up. After the previous calibration for CAL_INTRO_MS
 // (so it's clear one starts), for CAL_MS each
 // second first averages each band's level with the panel dark: lit pixels put noise into the
 // ADC themselves, and with the needle up the panel is dark, so that is the noise the bars
@@ -1085,7 +1085,7 @@ static void applyNoise(const int8_t* noise, const char* source)
 
 static void beginCalibration()
 {
-    pinMode(PIN_BUTTON_UP, INPUT_PULLUP);
+    pinMode(PIN_BUTTON_DOWN, INPUT_PULLUP);
     int8_t stored[BANDS];
     prefs.begin("vinyl");
     // a calibration only fits the band layout it was measured with
@@ -1128,7 +1128,7 @@ static bool updateCalibration()
     static float sum[BANDS], loudest[BANDS];
     static float dotFrom[BANDS], dotTo[BANDS];  // rows, where each dot glides from and to this second
 
-    bool pressed = digitalRead(PIN_BUTTON_UP) == LOW;
+    bool pressed = digitalRead(PIN_BUTTON_DOWN) == LOW;
     if (!pressed) released = true;
     if (!calibrating)
     {
@@ -1201,8 +1201,9 @@ static bool updateCalibration()
         drawCalDots(rows);
         const int seconds = CAL_MS / 1000, second = elapsed / 1000;
         int progress = lroundf(LED_COLS * (second + eased) / seconds);
-        fillRect(0, 0, progress, 1, rgb(colorRow[0]));
-        fillRect(0, LED_ROWS - 1, progress, 1, rgb(colorRow[0]));
+        // the bars' top color, so they stand apart from the dots in the peaks' color
+        fillRect(0, 0, progress, 1, rgb(colorRow[LED_ROWS - 1]));
+        fillRect(0, LED_ROWS - 1, progress, 1, rgb(colorRow[LED_ROWS - 1]));
     }
     show();
     return true;
@@ -1235,7 +1236,7 @@ void setup()
     while (1) delay(1000);
 #endif
 
-    // soft sage at the bottom fading into lilac on top
+    // soft lilac at the bottom fading into sage on top, the peaks lilac
     const uint8_t sage[3] = {185, 233, 189}, lilac[3] = {229, 181, 255};
     fillGradient(colorRow, lilac, sage);
     colorPeak = {lilac[0], lilac[1], lilac[2]};
@@ -1266,7 +1267,7 @@ void loop()
     if (updateCalibration()) return;
 
     // with the needle up, "above noise" should sit around -NOISE_MARGIN_DB; if a band
-    // twitches, recalibrate (hold UP)
+    // twitches, recalibrate (hold DOWN)
     static uint32_t lastPrint = 0;
     if (millis() - lastPrint > 1000)
     {
