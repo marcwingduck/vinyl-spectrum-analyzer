@@ -56,6 +56,9 @@
 #define MM_SIZE 32    // frames averaged for silence detection
 #define ATTACK_MS 25  // how fast bars rise to a new level
 #define SLIDE_MS 500    // pushes run this long: new album down, new title left, tape out
+// the bars rise from nothing rather than snap in: after the tape has left at boot, and as a
+// record track's names leave
+#define BARS_IN_MS 800
 #define RELEASE_MS 140  // how slowly they sink back; raise for calmer bars
 
 // MatrixPortal S3 pins (as in Adafruit's Protomatter examples):
@@ -342,8 +345,10 @@ static void drawBars(int dy, int newAbove = 0, float grow = 1.0f)
 
 static void draw()
 {
+    // right after the boot the tape has just slid out: the bars rise into the empty panel
+    uint32_t sinceTape = bootElapsed() - (BOOT_MS + SLIDE_MS);
     matrix.clearScreen();
-    drawBars(0);
+    drawBars(0, 0, sinceTape < BARS_IN_MS ? easeOut(sinceTape / (float)BARS_IN_MS) : 1.0f);
     show();
 }
 
@@ -385,7 +390,6 @@ static void draw()
 #define PULL_MS 700
 #define SPIN_MS 2100
 #define MOVE_MS 1800
-#define BARS_IN_MS 800  // the bars rise back from nothing as the names leave, rather than snap in
 #define RECORD_DEG_PER_MS (33.333f * 360 / 60000)  // 33 1/3 rpm
 #define ART_SIZE 16
 #define TEXT_MAX 128
