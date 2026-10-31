@@ -38,9 +38,10 @@
 #define NOISE_MARGIN_DB 6    // bars start this far above each band's measured noise
 #define CAL_HOLD_MS 2000     // hold the UP button this long to calibrate, with the needle up
 #define CAL_MS 15000         // calibration measures this long, keeping each band's loudest second
-// The DMA library dims in hardware, by shortening how long the LEDs are on, so moderate
-// dimming keeps the color depth; very low values lose the darkest tones
-#define BRIGHTNESS 180  // 0-255
+// Keep it at 255. The DMA library dims by pulsing the LEDs off within every row, and those
+// current pulses reach the ADC: at 180 the Spotify view added 9-15 dB to the bass and mid
+// bands, the board took that for vinyl and swapped to the bars every few seconds.
+#define BRIGHTNESS 255  // 0-255
 #define DISPLAY_DB 20        // range the bars show, from the top of the scale down
 // The top of the scale jumps to any louder band at once and sinks this fast after it,
 // so the loudest moment just reaches the top and nothing is cut off there (an average
@@ -485,6 +486,10 @@ static void draw()
 #define HELLO_MS 2000        // until snapserver-lcd answers, ask it for the state this often
 #define VINYL_HOLD_MS 3000   // silence needed before handing the panel to spotify
 #define VINYL_DB 6           // above the bars' floor before it counts as vinyl; hum wanders
+// While Spotify's cover and text light the panel, its current reaches the ADC: up to ~5 dB
+// at full brightness, 9-15 dB dimmed. Vinyl must be louder than that to take over, so the
+// panel can't swap back and forth on its own interference.
+#define VINYL_OVER_SPOTIFY_DB 20
 // A new track: the needle drops, or the level falls GAP_DB below the recent loud level
 // for GAP_MS (the groove still crackles, so not down to the floor) and comes back.
 // CLIP_DELAY_MS into the track the board asks for a clip; gapless sides every RECHECK_MS.
@@ -538,6 +543,10 @@ struct NowPlaying
     } slideFrom;
     Track track, previous;  // previous is only drawn while it slides out
 } np;
+
+// how far above the bars' floor the turntable must be to count as vinyl; higher while the
+// Spotify view (or its slide out) lights the panel
+static int vinylThreshold() { return np.visible || np.leaving ? VINYL_OVER_SPOTIFY_DB : VINYL_DB; }
 
 // the record on the turntable, recognized by groove-id on tape
 struct Record
@@ -917,7 +926,7 @@ static void logIdle()
                 if (bands[b] - bandNoise[b] > bands[loudest] - bandNoise[loudest]) loudest = b;
             sendLog("%lus vinyl on: band %d (%d-%d Hz) %+.1f dB above its floor, needs %+d", millis() / 1000,
                     loudest, (int)(bandEdge[loudest] * binHz), (int)(bandEdge[loudest + 1] * binHz),
-                    bands[loudest] - bandNoise[loudest], VINYL_DB);
+                    bands[loudest] - bandNoise[loudest], vinylThreshold());
             vinylSince = millis();
         }
         else
@@ -1019,7 +1028,7 @@ static bool updateNowPlaying()
     updateClip();
     if (np.active && millis() - np.lastPacket > NP_TIMEOUT_MS) np.active = false;
 
-    if (signalDb > VINYL_DB) lastVinyl = millis();
+    if (signalDb > vinylThreshold()) lastVinyl = millis();
 #ifdef IDLE_LOG
     logIdle();
 #endif

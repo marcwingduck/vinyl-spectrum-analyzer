@@ -88,7 +88,7 @@ Only built when `src/secrets.h` exists, see [Build and flash](#build-and-flash).
 
 The board joins WiFi as `vinyl-matrix.local` and listens on UDP port 4210. snapserver-lcd sends one datagram per change and repeats it every 10 s. Once on WiFi, the board broadcasts a hello, which snapserver-lcd answers right away, so a track that is already playing shows up as soon as the boot animation ends. If nothing arrives for 30 s, or a stop packet comes in, the panel returns to the spectrum. If the board never connects, the spectrum runs as before.
 
-Vinyl always wins. The ADC only hears the turntable, so a band rising `VINYL_DB` (6 dB) above where its bars start switches to the spectrum straight away. The extra margin keeps wandering mains hum from taking the panel from Spotify. The panel goes back to Spotify only after `VINYL_HOLD_MS` of silence.
+Vinyl always wins. The ADC only hears the turntable, so a band rising `VINYL_DB` (6 dB) above where its bars start switches to the spectrum straight away. The extra margin keeps wandering mains hum from taking the panel from Spotify. While the Spotify view is on, the bar is `VINYL_OVER_SPOTIFY_DB` (20 dB): its lit cover and text put a few dB of interference into the ADC themselves, and the panel would otherwise swap back and forth on it. A real record is far louder. The panel goes back to Spotify only after `VINYL_HOLD_MS` of silence.
 
 Datagram layout (version 4). Everything after byte 3 is only sent with `P` and `V`:
 
@@ -135,7 +135,7 @@ All settings are `#define`s at the top of [src/main.cpp](src/main.cpp).
 | `RECHECK_MS` | 120000 | Clip interval when no gap shows up, for sides without pauses |
 | `POP_MS` | 8000 | How long a recognized track stays before the bars return. Long names stretch it to `POP_MAX_MS` (15000) so they scroll through once |
 
-The colors are the `sage` and `lilac` RGB values in `setup()`. `BRIGHTNESS` (0–255, 180 by default) dims the panel in hardware, by shortening how long the LEDs are on, so moderate dimming keeps the color depth; very low values lose the darkest tones. A tinted film or smoked acrylic in front works too.
+The colors are the `sage` and `lilac` RGB values in `setup()`. Everything runs at full brightness. `BRIGHTNESS` can dim the panel in hardware, but leave it at 255: the library dims by pulsing the LEDs off within every row, and those current pulses reach the ADC. At 180, the Spotify view added 9–15 dB to the bass and mid bands, the board took that for vinyl and swapped to the bars every few seconds. Tame the panel with a tinted film or smoked acrylic in front instead.
 
 **Calibrating the noise floor:** the noise isn't even across bands. Mains hum puts 50 Hz and its harmonics well above the rest, so each band has its own floor. Calibrate wherever the board will run, since the hum depends on cables and power supply: lift the needle, then hold the **UP** button for 2 seconds. A progress bar runs for 15 seconds while each band is measured. The result is stored in flash and survives power cuts and firmware updates, unless an update changes the bands (`SAMPLE_HZ`, `FFT_N`, `BAND_LOW_HZ`), which needs a new calibration. So does a change to the panel driver or its refresh settings: the panel's refresh couples into the ADC, and switching from Protomatter to the DMA library raised the idle level by about 9 dB, so the outer bands stayed lit until a recalibration. Until the first calibration, the defaults in `bandNoiseDb` apply. With the needle up, `pio device monitor` should then show `above noise` around `-NOISE_MARGIN_DB`.
 
