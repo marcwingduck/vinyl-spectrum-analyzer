@@ -198,7 +198,7 @@ static const uint8_t cassettePalette[][3] = {
     {255, 255, 255},  // B shell, lit edge
     {64, 64, 64},     // C shell, shadow edge
     {190, 70, 255},   // D label
-    {0, 0, 0},        // E window
+    {44, 40, 36},     // E window, smoked plastic
     {255, 255, 255},  // F reel hubs
     {32, 32, 32},     // G screws
 };
