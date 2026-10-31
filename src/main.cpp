@@ -1,7 +1,7 @@
 #include <Arduino.h>
 #include <Preferences.h>
 #include <arduinoFFT.h>
-#include <driver/adc.h>
+#include <esp_adc/adc_continuous.h>
 
 #include "cassette.h"
 #include "panel.h"
@@ -20,8 +20,8 @@
 #include "secrets.h"
 #endif
 
-// Uncomment to broadcast stray peaks while the turntable is silent (needs secrets.h).
-// Off, it costs nothing; see "Stray peaks while idle" in the README.
+// Broadcasts stray peaks while the turntable is silent (needs secrets.h); comment it out
+// to stop. Off, it costs nothing; see "Stray peaks while idle" in the README.
 #define IDLE_LOG
 
 // A3 = GPIO10 = ADC1 channel 9. A0 and A4 sit on ADC2, which stops working once WiFi runs.
@@ -54,12 +54,12 @@
 // as the top did that to every peak above it, and the bass stuck to the ceiling)
 #define SCALE_DECAY_DB_S 6
 #define MM_SIZE 32    // frames averaged for silence detection
-#define ATTACK_MS 25  // how fast bars rise to a new level
+#define ATTACK_MS 25    // how fast bars rise to a new level
+#define RELEASE_MS 140  // how slowly they sink back; raise for calmer bars
 #define SLIDE_MS 500    // pushes run this long: new album down, new title left, tape out
 // the bars rise from nothing rather than snap in: after the tape has left at boot, and as a
 // record track's names leave
 #define BARS_IN_MS 800
-#define RELEASE_MS 140  // how slowly they sink back; raise for calmer bars
 
 // MatrixPortal S3 pins (as in Adafruit's Protomatter examples):
 // R1 G1 B1 R2 G2 B2, A B C (D and E unused on a 16-row panel), LAT OE CLK
@@ -88,7 +88,7 @@ float bandsRaw[BANDS];  // before despiking, for the UDP log
 float bandHistory[2][BANDS];   // the two frames before, for despiking
 uint16_t bandEdge[BANDS + 1];  // first FFT bin of each band, plus the end of the last
 // Each band's level with the needle up, in dB. Measured, because the noise isn't even:
-// mains hum puts 50 Hz and its harmonics well above the rest. Holding UP recalibrates
+// mains hum puts 50 Hz and its harmonics well above the rest. Holding DOWN recalibrates
 // and stores the result in flash; these are the defaults until then (measured with an
 // earlier band layout, so only rough: calibrate once after flashing).
 static const int8_t bandNoiseDb[BANDS] = {-34, -40, -43, -44, -45, -43, -39, -41,
@@ -102,6 +102,7 @@ uint32_t samplesUsed;  // FFT samples taken since the last print, to check SAMPL
 
 // one frame of DMA results, 4 bytes each
 uint8_t adcBuf[FFT_N * OVERSAMPLE * SOC_ADC_DIGI_RESULT_BYTES];
+adc_continuous_handle_t adc;
 
 #ifdef NOW_PLAYING
 // Song recognition: whoever connects to CLIP_PORT gets the next CLIP_S seconds of
@@ -164,38 +165,37 @@ static bool booting() { return bootElapsed() < BOOT_MS; }
 // with nothing to push it out, the tape slides down on its own
 static bool ejecting() { return bootElapsed() < BOOT_MS + SLIDE_MS; }
 
-// how far a push has come, 0..1 over SLIDE_MS; ease out: fast start, settles gently
-static float slideProgress(uint32_t elapsed)
-{
-    float p = 1.0f - min(elapsed, (uint32_t)SLIDE_MS) / (float)SLIDE_MS;
-    return 1.0f - p * p;
-}
+// how far a push has come, 0..1 over SLIDE_MS
+static float slideProgress(uint32_t elapsed) { return easeOut(elapsed / (float)SLIDE_MS); }
+// how many rows a push down has moved
+static int slideRows(uint32_t elapsed) { return lroundf(slideProgress(elapsed) * LED_ROWS); }
+// the share of their height the bars have risen back to, ms after they started
+static float barsIn(float ms) { return easeOut(ms / BARS_IN_MS); }
 
 // The ADC samples on its own timer at SAMPLE_HZ * OVERSAMPLE and DMA collects the
 // results, so the timing is exact and sampling goes on while a frame is drawn.
 static void beginAudio()
 {
-    adc_digi_init_config_t init = {};
-    init.max_store_buf_size = sizeof(adcBuf) * 2;  // room for a frame of lag
-    init.conv_num_each_intr = 256 * SOC_ADC_DIGI_RESULT_BYTES;
-    init.adc1_chan_mask = BIT(AUDIO_CHANNEL);
+    adc_continuous_handle_cfg_t handle = {};
+    handle.max_store_buf_size = sizeof(adcBuf) * 2;  // room for a frame of lag
+    handle.conv_frame_size = 256 * SOC_ADC_DIGI_RESULT_BYTES;
+    ESP_ERROR_CHECK(adc_continuous_new_handle(&handle, &adc));
 
-    static adc_digi_pattern_config_t pattern = {};
+    adc_digi_pattern_config_t pattern = {};
     pattern.atten = ADC_ATTEN_DB_12;
     pattern.channel = AUDIO_CHANNEL;
-    pattern.unit = 0;  // ADC1; Espressif's example encodes this in the channel, which breaks above 7
+    pattern.unit = ADC_UNIT_1;  // Espressif's example masks the channel to 3 bits, which breaks above 7
     pattern.bit_width = SOC_ADC_DIGI_MAX_BITWIDTH;
 
-    adc_digi_configuration_t config = {};
+    adc_continuous_config_t config = {};
     config.pattern_num = 1;
-    config.adc_pattern = &pattern;
+    config.adc_pattern = &pattern;  // copied by the driver
     config.sample_freq_hz = SAMPLE_HZ * OVERSAMPLE;
     config.conv_mode = ADC_CONV_SINGLE_UNIT_1;
     config.format = ADC_DIGI_OUTPUT_FORMAT_TYPE2;
 
-    ESP_ERROR_CHECK(adc_digi_initialize(&init));
-    ESP_ERROR_CHECK(adc_digi_controller_configure(&config));
-    ESP_ERROR_CHECK(adc_digi_start());
+    ESP_ERROR_CHECK(adc_continuous_config(adc, &config));
+    ESP_ERROR_CHECK(adc_continuous_start(adc));
 }
 
 static void sampleAudio()
@@ -208,12 +208,12 @@ static void sampleAudio()
     {
         // ask only for what is still missing, so no samples are thrown away
         uint32_t want = ((FFT_N - n) * OVERSAMPLE - k) * SOC_ADC_DIGI_RESULT_BYTES, len = 0;
-        adc_digi_read_bytes(adcBuf, want, &len, ADC_MAX_DELAY);
+        if (adc_continuous_read(adc, adcBuf, want, &len, ADC_MAX_DELAY) != ESP_OK) continue;
 
         for (uint32_t i = 0; i + SOC_ADC_DIGI_RESULT_BYTES <= len && n < FFT_N; i += SOC_ADC_DIGI_RESULT_BYTES)
         {
             const adc_digi_output_data_t* d = (const adc_digi_output_data_t*)&adcBuf[i];
-            if (d->type2.unit != 0 || d->type2.channel != AUDIO_CHANNEL) continue;
+            if (d->type2.unit != ADC_UNIT_1 || d->type2.channel != AUDIO_CHANNEL) continue;
 
             acc += d->type2.data;
             if (++k < OVERSAMPLE) continue;
@@ -241,20 +241,18 @@ static void runFFT()
 {
     FFT.windowing(FFTWindow::Hamming, FFTDirection::Forward);
     FFT.compute(FFTDirection::Forward);
-    FFT.complexToMagnitude();
 
     float maxDb = -1e9f, maxSignal = -1e9f;
+    const float norm = 1.0f / ((float)FFT_N * FFT_N);
 
     for (int b = 0; b < BANDS; b++)
     {
         // summing power over the band means wide treble bands collect as much as narrow
-        // bass ones, which offsets music's falling energy toward the top
+        // bass ones, which offsets music's falling energy toward the top; straight from the
+        // complex bins, without the square root of a magnitude
         float power = 0.0f;
         for (int i = bandEdge[b]; i < bandEdge[b + 1]; i++)
-        {
-            float mag = vReal[i] / FFT_N;
-            power += mag * mag;
-        }
+            power += (vReal[i] * vReal[i] + vImag[i] * vImag[i]) * norm;
 
         // median of the last three frames: interference (the TV, a WiFi burst) lasts one
         // frame and would leave a stray peak marker, music lasts longer
@@ -279,16 +277,9 @@ static void runFFT()
 }
 
 // one color per row, bottom to top
-static void fillGradient(Rgb* rows, const uint8_t bottom[3], const uint8_t top[3])
+static void fillGradient(Rgb* rows, Rgb bottom, Rgb top)
 {
-    for (int j = 0; j < LED_ROWS; j++)
-    {
-        uint32_t t = (uint32_t)j * 255 / (LED_ROWS - 1);
-        uint8_t c[3];
-        for (int k = 0; k < 3; k++)
-            c[k] = (bottom[k] * (255 - t) + top[k] * t) / 255;
-        rows[j] = {c[0], c[1], c[2]};
-    }
+    for (int j = 0; j < LED_ROWS; j++) rows[j] = mix(bottom, top, j / (float)(LED_ROWS - 1));
 }
 
 // draws the bars shifted down by dy rows, without clearing or showing the panel;
@@ -324,9 +315,9 @@ static void drawBars(int dy, int newAbove = 0, float grow = 1.0f)
         if (val > peaks[i])
         {
             peaks[i] = val;
-            peakMillis[i] = millis();
+            peakMillis[i] = now;
         }
-        else if (peaks[i] > 0 && millis() - peakMillis[i] > PEAK_FALLOFF_MS)
+        else if (peaks[i] > 0 && now - peakMillis[i] > PEAK_FALLOFF_MS)
         {
             peaks[i] -= 1;
         }
@@ -346,9 +337,8 @@ static void drawBars(int dy, int newAbove = 0, float grow = 1.0f)
 static void draw()
 {
     // right after the boot the tape has just slid out: the bars rise into the empty panel
-    uint32_t sinceTape = bootElapsed() - (BOOT_MS + SLIDE_MS);
     matrix.clearScreen();
-    drawBars(0, 0, sinceTape < BARS_IN_MS ? easeOut(sinceTape / (float)BARS_IN_MS) : 1.0f);
+    drawBars(0, 0, barsIn(bootElapsed() - (BOOT_MS + SLIDE_MS)));
     show();
 }
 
@@ -507,6 +497,9 @@ static uint32_t scrollFrames(int width)
     return width > LED_COLS - TEXT_X ? scrollHoldFrames + (width + SCROLL_GAP) * scrollFramesPerPx : 0;
 }
 
+// px a scroll has moved f frames after it started: it waits scrollHoldFrames, then steps
+static int scrollOffset(uint32_t f) { return f > scrollHoldFrames ? (f - scrollHoldFrames) / scrollFramesPerPx : 0; }
+
 // Packet: "NP" version cmd, then for cmd 'P' (spotify):
 // 16x16 RGB888 art (row-major), accent RGB, artist\0, title\0 (UTF-8)
 // cmd 'S' (or silence for NP_TIMEOUT_MS) ends the now playing view.
@@ -544,13 +537,7 @@ static void receiveNowPlaying()
         for (int k = 0; k < 6; k++) pendingAlbumColors |= bars[k] != 0;
         if (pendingAlbumColors)
         {
-            uint8_t bottom[3], top[3];
-            for (int k = 0; k < 3; k++)
-            {
-                bottom[k] = bars[k];
-                top[k] = bars[3 + k];
-            }
-            fillGradient(pendingRow, bottom, top);
+            fillGradient(pendingRow, {bars[0], bars[1], bars[2]}, {bars[3], bars[4], bars[5]});
             pendingPeak = t.accent;
         }
         // a recheck of the playing track changes nothing visible, so it applies at once
@@ -559,7 +546,8 @@ static void receiveNowPlaying()
         return;
     }
 
-    heardFromPi = true;  // snapserver-lcd; groove-id doesn't answer the hello
+    if (packet[3] == 'H') return;  // our own hello, broadcast back to us
+    heardFromPi = true;            // snapserver-lcd; groove-id doesn't answer the hello
     if (packet[3] == 'S')
     {
         np.active = false;
@@ -599,10 +587,10 @@ static void drawMarquee(const char* s, int width, int dx, int baseline, uint16_t
 
     if (width > area)
     {
-        uint32_t period = width + SCROLL_GAP;
-        cycle = max(cycle, scrollHoldFrames + period * scrollFramesPerPx);
+        const int period = width + SCROLL_GAP;
+        cycle = max(cycle, scrollFrames(width));
         uint32_t t = frames > since ? (frames - since) % cycle : 0;  // since may lie ahead
-        if (t > scrollHoldFrames) offset = min((t - scrollHoldFrames) / scrollFramesPerPx, period);
+        offset = min(scrollOffset(t), period);
         text.drawUTF8(x0 - offset + period, baseline, s);
     }
 
@@ -619,13 +607,17 @@ static void drawTitle(const Track& t, int dx, int dy, uint32_t cycle = 0)
     drawMarquee(t.title, t.titleWidth, dx, TITLE_BASELINE + dy, rgb(255, 255, 255), t.titleSince, cycle);
 }
 
+static void drawCover(const Track& t, int x0, int dy)
+{
+    for (int y = 0; y < ART_SIZE; y++)
+        for (int x = 0; x < ART_SIZE; x++) drawRgb(x0 + x, y + dy, t.art[y * ART_SIZE + x]);
+}
+
 // the gap and artwork go last so they cover text scrolling out to the left
 static void drawArt(const Track& t, int dy)
 {
     fillRect(ART_SIZE, dy, TEXT_X - ART_SIZE, LED_ROWS, 0);
-    for (int y = 0; y < ART_SIZE; y++)
-        for (int x = 0; x < ART_SIZE; x++)
-            drawRgb(x, y + dy, t.art[y * ART_SIZE + x]);
+    drawCover(t, 0, dy);
 }
 
 // draws a track shifted down by dy rows; whatever leaves the panel is clipped
@@ -643,12 +635,11 @@ static void drawNowPlaying()
     uint32_t elapsed = millis() - np.slideSince;
     if (elapsed < SLIDE_MS)
     {
-        float eased = slideProgress(elapsed);
         if (np.slideFrom == NowPlaying::FROM_TITLE)
         {
             // the new title pushes the old one left, under the artwork
             const int area = LED_COLS - TEXT_X;
-            int edge = LED_COLS - lroundf(eased * area);
+            int edge = LED_COLS - lroundf(slideProgress(elapsed) * area);
             drawArtist(np.track, 0, 0);
             drawTitle(np.previous, edge - LED_COLS, 0);
             // a long old title would run on under the new one
@@ -658,7 +649,7 @@ static void drawNowPlaying()
         }
         else
         {
-            int dy = lroundf(eased * LED_ROWS);
+            int dy = slideRows(elapsed);
             if (np.slideFrom == NowPlaying::FROM_TRACK) drawTrack(np.previous, dy);
             if (np.slideFrom == NowPlaying::FROM_CASSETTE) drawCassette(bootElapsed(), dy);
             drawTrack(np.track, dy - LED_ROWS);
@@ -891,18 +882,10 @@ static void logIdle()
 
 #define RECORD_X (LED_COLS - RECORD_SIZE)  // the intro's record turns in the right half
 
-static void drawCover(const Track& t, int x0, int dy)
-{
-    for (int y = 0; y < ART_SIZE; y++)
-        for (int x = 0; x < ART_SIZE; x++) drawRgb(x0 + x, y + dy, t.art[y * ART_SIZE + x]);
-}
-
 // Text over the bars: dark pixels beside each of its pixels keep it readable, so the bars can
 // show everywhere else instead of behind a black block. Where they go: all eight neighbors
 // outline it, {1, 0} alone is a shadow to the right.
-// static const int8_t textShadow[][2] = {{1, 0}, {1, 1}};
 static const int8_t textShadow[][2] = {{1, 0}};
-// static const int8_t textShadow[][2] = {{-1, -1}, {0, -1}, {1, -1}, {-1, 0}, {1, 0}, {-1, 1}, {0, 1}, {1, 1}};
 
 static void drawOutlined(const char* s, int x, int baseline, uint16_t color)
 {
@@ -944,9 +927,9 @@ static bool drawPopIn()
     if (record.exitFrame)  // the bars are back; after the usual pause it all scrolls out to the left
     {
         uint32_t f = frames - record.exitFrame;
-        int offset = f > scrollHoldFrames ? (f - scrollHoldFrames) / scrollFramesPerPx : 0;
+        int offset = scrollOffset(f);
         if (offset > TEXT_X + max(track.artistWidth, track.titleWidth)) return false;  // outline included
-        drawBars(0, 0, easeOut(f * FRAME_MS / BARS_IN_MS));  // rising back in during the pause
+        drawBars(0, 0, barsIn(f * FRAME_MS));  // rising back in during the pause
         drawOutlined(track.artist, TEXT_X - offset, ARTIST_BASELINE, track.colorArtist);
         drawOutlined(track.title, TEXT_X - offset, TITLE_BASELINE, rgb(255, 255, 255));
         drawCover(track, -offset, 0);
@@ -960,13 +943,13 @@ static bool drawPopIn()
     }
     else if (!record.spins)  // the next track of the same record pushes the bars down, like any new track
     {
-        int dy = lroundf(slideProgress(t) * LED_ROWS);
+        int dy = slideRows(t);
         drawBars(dy);
         drawTrack(track, dy - LED_ROWS);
     }
     else if (t < pullAt)  // the cover comes down in its place on the left, over the bars
     {
-        int bottom = lroundf(slideProgress(t) * LED_ROWS);  // the cover's lower edge
+        int bottom = slideRows(t);  // the cover's lower edge
         drawBars(0, bottom);  // above it, the bars already have the new colors
         drawCover(track, 0, bottom - LED_ROWS);
     }
@@ -974,7 +957,7 @@ static bool drawPopIn()
     {
         drawBars(0);  // they go on in the record's corners
         drawRecord(lroundf(easeOut((t - pullAt) / (float)PULL_MS) * RECORD_X), track.accent,
-                   (t - pullAt) * RECORD_DEG_PER_MS, 1.0f);
+                   (t - pullAt) * RECORD_DEG_PER_MS);
         drawCover(track, 0, 0);  // over the record: it comes out from inside
     }
     else  // the names push the record over the cover, it glides on and off the panel
@@ -990,7 +973,7 @@ static bool drawPopIn()
         drawTitle(track, dx, 0, cycle);
         drawCover(track, 0, 0);
         // on top, only its round part: the cover shows around it
-        drawRecord(recordX, track.accent, (t - pullAt) * RECORD_DEG_PER_MS, 1.0f);
+        drawRecord(recordX, track.accent, (t - pullAt) * RECORD_DEG_PER_MS);
     }
     show();
     return true;
@@ -1055,7 +1038,7 @@ static bool updateNowPlaying()
     if (np.leaving)
     {
         matrix.clearScreen();
-        drawTrack(np.track, lroundf(slideProgress(millis() - np.leaveSince) * LED_ROWS));
+        drawTrack(np.track, slideRows(millis() - np.leaveSince));
         show();
     }
     if (vinyl && record.known && !ejecting() && drawPopIn()) return true;
@@ -1198,8 +1181,7 @@ static bool updateCalibration()
     matrix.clearScreen();
     if (showing)
     {
-        float t = (inSecond - (1000 - CAL_SHOW_MS)) / (float)CAL_SHOW_MS, p = 1.0f - t;
-        float eased = 1.0f - p * p;  // fast start, settles gently, like the slides
+        float eased = easeOut((inSecond - (1000 - CAL_SHOW_MS)) / (float)CAL_SHOW_MS);  // like the slides
         float rows[BANDS];
         for (int b = 0; b < BANDS; b++) rows[b] = dotFrom[b] + (dotTo[b] - dotFrom[b]) * eased;
         drawCalDots(rows);
@@ -1241,9 +1223,9 @@ void setup()
 #endif
 
     // soft lilac at the bottom fading into sage on top, the peaks lilac
-    const uint8_t sage[3] = {185, 233, 189}, lilac[3] = {229, 181, 255};
+    const Rgb sage = {185, 233, 189}, lilac = {229, 181, 255};
     fillGradient(colorRow, lilac, sage);
-    colorPeak = {lilac[0], lilac[1], lilac[2]};
+    colorPeak = lilac;
 
     // Log-spaced band edges. The FFT is too coarse to split the bass logarithmically,
     // so each band takes at least one bin of its own: linear up to ~230 Hz, log above.
@@ -1300,7 +1282,7 @@ void loop()
 
     if (ejecting())
     {
-        int dy = booting() ? 0 : lroundf(slideProgress(bootElapsed() - BOOT_MS) * LED_ROWS);
+        int dy = booting() ? 0 : slideRows(bootElapsed() - BOOT_MS);
         matrix.clearScreen();
         drawCassette(bootElapsed(), dy);
         show();

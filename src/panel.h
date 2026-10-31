@@ -43,6 +43,13 @@ inline Rgb scaled(Rgb c, float f)
     return {(uint8_t)lroundf(c.r * f), (uint8_t)lroundf(c.g * f), (uint8_t)lroundf(c.b * f)};
 }
 
+// from a at 0 to b at 1
+inline Rgb mix(Rgb a, Rgb b, float t)
+{
+    return {(uint8_t)lroundf(a.r + (b.r - a.r) * t), (uint8_t)lroundf(a.g + (b.g - a.g) * t),
+            (uint8_t)lroundf(a.b + (b.b - a.b) * t)};
+}
+
 // 0..1 -> 0..1, fast start, settles gently
 inline float easeOut(float p)
 {

@@ -1,3 +1,4 @@
+.vscode/
 .pio/
 .DS_Store
 src/secrets.h

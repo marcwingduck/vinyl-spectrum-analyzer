@@ -2,6 +2,9 @@
 
 #include "panel.h"
 
+#define REEL_STEP_MS 500
+#define FADE_FROM 0.2f  // brightness the cassette fades in from, at 8 bits per channel
+
 // boot screen: '.' is off, letters index cassettePalette; lit from the top left
 static const char* const cassette[LED_ROWS] = {
     ".....BBBBBBBBBBBBBBBBBBBBBB.....",
@@ -21,7 +24,7 @@ static const char* const cassette[LED_ROWS] = {
     "....BGABAA.AAAAAAAAAA.AACAGC....",
     ".....CCBCCCCCCCCCCCCCCCCCCC.....",
 };
-static const uint8_t cassettePalette[][3] = {
+static const Rgb cassettePalette[] = {
     {128, 128, 128},  // A shell
     {255, 255, 255},  // B shell, lit edge
     {64, 64, 64},     // C shell, shadow edge
@@ -30,21 +33,15 @@ static const uint8_t cassettePalette[][3] = {
     {255, 255, 255},  // F reel hubs
     {32, 32, 32},     // G screws
 };
-static const int cassetteColorCount = sizeof(cassettePalette) / 3;
+static const int cassetteColorCount = sizeof(cassettePalette) / sizeof(Rgb);
 static const float glintShine[] = {0.0f, 0.45f, 0.85f};  // blend toward white: none, edge, core
 static const int reelX[] = {10, 20}, reelY = 6;          // top left of the 2x2 reel hubs
 static const int loadX = 13, loadW = 6;                  // the D window between the hubs
-static const uint8_t tapeColor[3] = {180, 145, 72};      // amber; LEDs push warm tones red
+static const Rgb tapeColor = {180, 145, 72};             // amber; LEDs push warm tones red
 // full 8 bits per channel: through rgb()'s 5 bits the fade crept up in visible steps
-static Rgb cassetteColor(const uint8_t color[3], float level, float shine)
+static Rgb cassetteColor(Rgb color, float level, float shine)
 {
-    uint8_t c[3];
-    for (int k = 0; k < 3; k++)
-    {
-        float v = color[k] + (255 - color[k]) * shine;
-        c[k] = (uint8_t)lroundf(v * level);
-    }
-    return {c[0], c[1], c[2]};
+    return scaled(mix(color, {255, 255, 255}, shine), level);
 }
 
 // how much of pixel (x, y) a tape pack of radius r around (cx, cy) covers, 0..1;
@@ -106,10 +103,8 @@ void drawCassette(uint32_t elapsed, int dy)
                 if (cover > 0.15f)
                 {
                     // the pack's edge pixel blends into the window by how much it covers
-                    uint8_t mixed[3];
-                    for (int k = 0; k < 3; k++)
-                        mixed[k] = lroundf(cassettePalette['E' - 'A'][k] + (tapeColor[k] - cassettePalette['E' - 'A'][k]) * cover);
-                    drawRgb(x, y + dy, cassetteColor(mixed, level, glintShine[shine]));
+                    Rgb window = mix(cassettePalette['E' - 'A'], tapeColor, cover);
+                    drawRgb(x, y + dy, cassetteColor(window, level, glintShine[shine]));
                     continue;
                 }
             }

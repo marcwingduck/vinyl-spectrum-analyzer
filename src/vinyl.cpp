@@ -22,7 +22,7 @@ static bool inSheen(float d, float apart, float shift)
     return false;
 }
 
-void drawRecord(int x0, Rgb label, float turnDeg, float level)
+void drawRecord(int x0, Rgb label, float turnDeg)
 {
     static float dist[RECORD_SIZE][RECORD_SIZE], angle[RECORD_SIZE][RECORD_SIZE];  // from the center
     static bool ready = false;
@@ -65,6 +65,6 @@ void drawRecord(int x0, Rgb label, float turnDeg, float level)
                 c = sheenColor;
             else
                 c = vinylColor;
-            drawRgb(x0 + x, y, scaled(c, level));
+            drawRgb(x0 + x, y, c);
         }
 }
