@@ -1,4 +1,4 @@
-#include <Adafruit_Protomatter.h>
+#include <ESP32-HUB75-MatrixPanel-I2S-DMA.h>
 #include <Arduino.h>
 #include <Preferences.h>
 #include <arduinoFFT.h>
@@ -52,13 +52,24 @@
 #define GAMMA 2.2f      // LEDs are linear, images are sRGB
 #define RELEASE_MS 140  // how slowly they sink back; raise for calmer bars
 
-// MatrixPortal S3 pins (as in Adafruit's Protomatter examples)
-uint8_t rgbPins[] = {42, 41, 40, 38, 39, 37};
-uint8_t addrPins[] = {45, 36, 48};
-uint8_t clockPin = 2, latchPin = 47, oePin = 14;
+// MatrixPortal S3 pins (as in Adafruit's Protomatter examples):
+// R1 G1 B1 R2 G2 B2, A B C (D and E unused on a 16-row panel), LAT OE CLK
+static const HUB75_I2S_CFG::i2s_pins matrixPins = {42, 41, 40, 38, 39, 37, 45, 36, 48, -1, -1, 47, 14, 2};
 
-Adafruit_Protomatter matrix(LED_COLS, 6, 1, rgbPins, 3, addrPins,
-                            clockPin, latchPin, oePin, true);
+// The LCD peripheral refreshes the panel by DMA, without the CPU; Protomatter's
+// timer-driven refresh flickered whenever WiFi sent a clip (not the power supply:
+// a lower transmit power made no difference). Double buffered: drawing goes
+// to the hidden buffer and show() swaps, so every frame is drawn in full.
+static HUB75_I2S_CFG matrixConfig()
+{
+    HUB75_I2S_CFG cfg(LED_COLS, LED_ROWS, 1, matrixPins);
+    cfg.double_buff = true;
+    cfg.clkphase = false;  // this panel latches on the other clock edge; true shifts everything 1 px left
+    return cfg;
+}
+MatrixPanel_I2S_DMA matrix(matrixConfig());
+
+static void show() { matrix.flipDMABuffer(); }
 
 float vReal[FFT_N], vImag[FFT_N];
 ArduinoFFT<float> FFT(vReal, vImag, FFT_N, (float)SAMPLE_HZ);
@@ -87,16 +98,14 @@ uint8_t adcBuf[FFT_N * OVERSAMPLE * SOC_ADC_DIGI_RESULT_BYTES];
 
 #ifdef NOW_PLAYING
 // Song recognition: whoever connects to CLIP_PORT gets the next CLIP_S seconds of
-// audio as raw 16-bit mono at SAMPLE_HZ. Recorded first, then sent CLIP_CHUNK bytes per
-// frame: in one 400 kB burst the WiFi made the panel flicker for half a second.
+// audio as raw 16-bit mono at SAMPLE_HZ. Recorded first and sent in one burst, so
+// WiFi disturbs the ADC once instead of every frame.
 #define CLIP_PORT 4212
-#define CLIP_CHUNK 4096  // ~100 frames, 2.5 s; raise for a shorter send, 0 for one burst
 #define CLIP_ASK_PORT 4213  // broadcast "clip <reason>" when a clip is worth fetching
 #define CLIP_S 10
 #define CLIP_SAMPLES (CLIP_S * SAMPLE_HZ)
 int16_t* clip;                     // 400 kB, in PSRAM
 uint32_t clipPos = CLIP_SAMPLES;  // recording while below CLIP_SAMPLES
-uint32_t clipSent = 0;             // bytes of the recorded clip sent so far
 #endif
 uint8_t peaks[LED_COLS];
 uint32_t peakMillis[LED_COLS];
@@ -452,7 +461,7 @@ static void draw()
 {
     matrix.fillScreen(colorOff);
     drawBars(0);
-    matrix.show();
+    show();
 }
 
 #ifdef NOW_PLAYING
@@ -532,6 +541,7 @@ struct Record
 WiFiUDP udp;
 WiFiServer clipServer(CLIP_PORT);
 WiFiClient clipClient;
+volatile bool clipSending = false;  // sendClip() owns clipClient until it clears this
 uint8_t packet[1200];
 uint8_t artGamma[256];
 uint32_t lastVinyl = -VINYL_HOLD_MS;  // no vinyl yet, so a track can take over right at boot
@@ -735,7 +745,7 @@ static void drawNowPlaying()
         drawTrack(np.track, 0);
     }
 
-    matrix.show();
+    show();
 }
 
 static void beginNowPlaying()
@@ -759,21 +769,34 @@ static void beginNowPlaying()
 }
 
 // Takes one clip request at a time: records while the client waits, then sends.
+// ~0.5 s for 400 kB. Recording has stopped by then, so the clip can't change underneath.
+static void sendClip(void*)
+{
+    clipClient.write((const uint8_t*)clip, CLIP_SAMPLES * sizeof(int16_t));
+    clipClient.stop();
+    clipSending = false;
+    vTaskDelete(nullptr);
+}
+
 static void updateClip()
 {
-    if (!clip) return;
+    if (!clip || clipSending) return;
     if (!clipClient)
     {
         clipClient = clipServer.accept();
-        if (clipClient) clipPos = clipSent = 0;
+        if (clipClient) clipPos = 0;
         return;
     }
     if (clipPos < CLIP_SAMPLES) return;
 
-    const uint32_t size = CLIP_SAMPLES * sizeof(int16_t);
-    uint32_t n = CLIP_CHUNK ? min((uint32_t)CLIP_CHUNK, size - clipSent) : size - clipSent;
-    clipSent += clipClient.write((const uint8_t*)clip + clipSent, n);
-    if (clipSent >= size || !clipClient.connected()) clipClient.stop();
+    // sent on core 0, next to the WiFi stack, so loop() on core 1 keeps the bars moving;
+    // sending here instead froze them for half a second right before the cover came in
+    clipSending = true;
+    if (xTaskCreatePinnedToCore(sendClip, "clip", 4096, nullptr, 1, nullptr, 0) != pdPASS)
+    {
+        clipClient.stop();  // no memory for the task: groove-id just gets no clip this time
+        clipSending = false;
+    }
 }
 
 static void tellGrooveId(const char* msg)
@@ -958,7 +981,7 @@ static bool drawPopIn()
     matrix.fillScreen(colorOff);
     drawBars(dy);
     drawTrack(record.track, dy - LED_ROWS);
-    matrix.show();
+    show();
     return true;
 }
 
@@ -1020,7 +1043,7 @@ static bool updateNowPlaying()
     {
         matrix.fillScreen(colorOff);
         drawTrack(np.track, lroundf(slideProgress(millis() - np.leaveSince) * LED_ROWS));
-        matrix.show();
+        show();
     }
     if (vinyl && record.known && !ejecting() && drawPopIn()) return true;
     return visible || np.leaving;
@@ -1113,7 +1136,7 @@ static bool updateCalibration()
     // progress bar across the middle rows
     matrix.fillScreen(colorOff);
     matrix.fillRect(0, LED_ROWS / 2 - 1, LED_COLS * elapsed / CAL_MS + 1, 2, colorPeak);
-    matrix.show();
+    show();
     return true;
 }
 
@@ -1123,11 +1146,26 @@ void setup()
 
     beginAudio();
 
-    if (matrix.begin() != PROTOMATTER_OK)
+    if (!matrix.begin())
     {
-        Serial.println("Protomatter init failed");
+        Serial.println("matrix init failed");
         while (1) delay(10);
     }
+    matrix.setBrightness8(255);  // full, see the README on dimming
+
+#ifdef PANEL_TEST
+    // a still image to check the panel mapping: white border, red top left, green top
+    // right, blue bottom left, yellow bottom right, a diagonal from the top left
+    matrix.fillScreen(0);
+    matrix.drawRect(0, 0, LED_COLS, LED_ROWS, rgb(255, 255, 255));
+    for (int i = 0; i < LED_ROWS; i++) matrix.drawPixel(i, i, rgb(0, 160, 255));
+    matrix.drawPixel(0, 0, rgb(255, 0, 0));
+    matrix.drawPixel(LED_COLS - 1, 0, rgb(0, 255, 0));
+    matrix.drawPixel(0, LED_ROWS - 1, rgb(0, 0, 255));
+    matrix.drawPixel(LED_COLS - 1, LED_ROWS - 1, rgb(255, 255, 0));
+    show();
+    while (1) delay(1000);
+#endif
 
     colorOff = rgb(0, 0, 0);
     // soft sage at the bottom fading into lilac on top
@@ -1193,7 +1231,7 @@ void loop()
         int dy = booting() ? 0 : lroundf(slideProgress(bootElapsed() - BOOT_MS) * LED_ROWS);
         matrix.fillScreen(colorOff);
         drawCassette(dy);
-        matrix.show();
+        show();
         cassetteShown = true;
         return;
     }
