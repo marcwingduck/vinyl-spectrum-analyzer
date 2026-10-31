@@ -88,7 +88,7 @@ Only built when `src/secrets.h` exists, see [Build and flash](#build-and-flash).
 
 The board joins WiFi as `vinyl-matrix.local` and listens on UDP port 4210. snapserver-lcd sends one datagram per change and repeats it every 10 s. Once on WiFi, the board broadcasts a hello, which snapserver-lcd answers right away, so a track that is already playing shows up as soon as the boot animation ends. If nothing arrives for 30 s, or a stop packet comes in, the panel returns to the spectrum. If the board never connects, the spectrum runs as before.
 
-Vinyl always wins. The ADC only hears the turntable, so a band rising `VINYL_DB` (6 dB) above where its bars start switches to the spectrum straight away. The extra margin keeps wandering mains hum from taking the panel from Spotify. While the Spotify view is on, the bar is `VINYL_OVER_SPOTIFY_DB` (20 dB): its lit cover and text put a few dB of interference into the ADC themselves, and the panel would otherwise swap back and forth on it. A real record is far louder. The panel goes back to Spotify only after `VINYL_HOLD_MS` of silence.
+Vinyl always wins. The ADC only hears the turntable, so a band rising `AUDIO_DB` (6 dB) above where its bars start switches to the spectrum straight away. The extra margin keeps wandering mains hum from taking the panel from Spotify. While the Spotify view is on, the bar is `VINYL_OVER_SPOTIFY_DB` (20 dB): its lit cover and text put a few dB of interference into the ADC themselves, and the panel would otherwise swap back and forth on it. A real record is far louder. The panel goes back to Spotify only after `VINYL_HOLD_MS` of silence.
 
 Datagram layout (version 4). Everything after byte 3 is only sent with `P` and `V`:
 
@@ -127,6 +127,9 @@ All settings are `#define`s at the top of [src/main.cpp](src/main.cpp).
 | `SAMPLE_HZ` | 20000 | FFT sample rate, so the bars reach `SAMPLE_HZ / 2`. The ADC runs at `OVERSAMPLE` times this on its own timer (DMA), up to 83 kHz |
 | `OVERSAMPLE` | 4 | ADC samples averaged per FFT sample. Each doubling takes ~3 dB off random noise, not off hum |
 | `SCROLL_MS_PER_PX` | 70 | Marquee speed of artist and title, ~14 px/s. Rounded to whole frames (one audio block each, ~21 ms at the default `FFT_N` and `SAMPLE_HZ`) so every step is equally long |
+| `STANDBY_MS` | 15000 | Silence before the bars go to standby: the panel stays dark, so noise can't light a bar while nothing plays. Long enough for fade-outs, gaps between tracks and quiet passages, so the bars don't drop out mid-record |
+| `WAKE_MS` | 1000 | How long audio has to play without a break to wake the bars; they rise back in over `BARS_IN_MS`. The board starts in standby after the boot cassette, so with nothing playing the panel stays dark through its noisiest first seconds |
+| `AUDIO_DB` | 6 | How far the loudest band has to rise above where its bars start to count as audio, for standby and for vinyl taking the panel from Spotify |
 | `VINYL_HOLD_MS` | 3000 | Silence needed before Spotify takes the panel back. Also ends a recognized record, so its colors go |
 | `GAP_DB` | 15 | How far the level has to fall below the recent loud level to count as a gap between tracks. Lower it to catch tracks that run into each other, at the risk of quiet passages asking for clips |
 | `GAP_MS` | 1000 | How long a gap has to last |
@@ -144,7 +147,7 @@ The colors are the `sage` and `lilac` RGB values in `setup()`. Everything runs a
 python3 -c 'import socket,time;s=socket.socket(2,2);s.bind(("",4211));[print(time.strftime("%H:%M:%S"),d.decode(),end="",flush=True) for _ in iter(int,1) if (d:=s.recv(512))]'
 ```
 
-Every minute the board broadcasts a heartbeat, and whenever a band rises above its noise floor while the turntable is silent, it sends one line: which band, how loud, how many frames, and how loud after the 3-frame median that hides one-frame interference. `-> SHOWN` marks the ones that made it onto the panel. It also reports where the noise floor came from (stored calibration or defaults) after boot and after each calibration, and every handover between Spotify and the spectrum, with the band that triggered it.
+Every minute the board broadcasts a heartbeat, and whenever a band rises above its noise floor while the turntable is silent and gets through the 3-frame median that hides one-frame interference, it sends one line: which band, how loud before and after the median, and for how many frames. Single frames the median throws away aren't reported; there are several a second. `-> SHOWN` marks the ones that lit the panel, `in standby` the ones that didn't. Going to standby and waking up are reported too. It also reports where the noise floor came from (stored calibration or defaults) after boot and after each calibration, and every handover between Spotify and the spectrum, with the band that triggered it.
 
 ## License
 

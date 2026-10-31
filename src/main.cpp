@@ -60,6 +60,11 @@
 // the bars rise from nothing rather than snap in: after the tape has left at boot, and as a
 // record track's names leave
 #define BARS_IN_MS 800
+// Standby: after STANDBY_MS without audio the bars go dark, so noise can't light them while the
+// turntable is silent. Only audio without a break for WAKE_MS brings them back, rising in.
+#define AUDIO_DB 6  // the loudest band this far above its bars' floor counts as audio; hum wanders
+#define STANDBY_MS 15000  // long enough for fade-outs, gaps and quiet passages
+#define WAKE_MS 1000
 
 // MatrixPortal S3 pins (as in Adafruit's Protomatter examples):
 // R1 G1 B1 R2 G2 B2, A B C (D and E unused on a 16-row panel), LAT OE CLK
@@ -164,6 +169,9 @@ static uint32_t bootElapsed() { return millis() - bootStart; }
 static bool booting() { return bootElapsed() < BOOT_MS; }
 // with nothing to push it out, the tape slides down on its own
 static bool ejecting() { return bootElapsed() < BOOT_MS + SLIDE_MS; }
+// The lit cassette puts noise into the ADC (+9 dB in the bass), and the level's average holds it
+// for another MM_SIZE frames (~0.8 s) after the tape has left: none of it is audio.
+static bool bootNoise() { return bootElapsed() < BOOT_MS + SLIDE_MS + 1000; }
 
 // how far a push has come, 0..1 over SLIDE_MS
 static float slideProgress(uint32_t elapsed) { return easeOut(elapsed / (float)SLIDE_MS); }
@@ -171,6 +179,34 @@ static float slideProgress(uint32_t elapsed) { return easeOut(elapsed / (float)S
 static int slideRows(uint32_t elapsed) { return lroundf(slideProgress(elapsed) * LED_ROWS); }
 // the share of their height the bars have risen back to, ms after they started
 static float barsIn(float ms) { return easeOut(ms / BARS_IN_MS); }
+
+// From the boot on: the first seconds are the noisiest (WiFi connecting), and a record already
+// playing wakes the bars after WAKE_MS anyway.
+bool standby = true;
+uint32_t lastAudio, lastQuiet;  // the last frame with and without audio
+uint32_t wakeAt;                // when the bars last started rising in
+
+// once per frame
+static void updateStandby()
+{
+    uint32_t now = millis();
+    if (signalDb > AUDIO_DB && !bootNoise())
+        lastAudio = now;
+    else
+        lastQuiet = now;
+
+    if (!standby && now - lastAudio > STANDBY_MS)
+    {
+        standby = true;
+        Serial.println("standby");
+    }
+    else if (standby && now - lastQuiet >= WAKE_MS)
+    {
+        standby = false;
+        wakeAt = now;
+        Serial.println("awake");
+    }
+}
 
 // The ADC samples on its own timer at SAMPLE_HZ * OVERSAMPLE and DMA collects the
 // results, so the timing is exact and sampling goes on while a frame is drawn.
@@ -336,9 +372,12 @@ static void drawBars(int dy, int newAbove = 0, float grow = 1.0f)
 
 static void draw()
 {
-    // right after the boot the tape has just slid out: the bars rise into the empty panel
+    // the bars rise into the empty panel as they wake up
     matrix.clearScreen();
-    drawBars(0, 0, barsIn(bootElapsed() - (BOOT_MS + SLIDE_MS)));
+    if (standby)
+        drawBars(LED_ROWS);  // off the panel, but they keep moving, so they rise in to the music
+    else
+        drawBars(0, 0, barsIn(millis() - wakeAt));
     show();
 }
 
@@ -354,7 +393,6 @@ static void draw()
 #define HELLO_MS 2000        // until snapserver-lcd answers, ask it for the state this often
 #define VINYL_HOLD_MS 3000   // silence needed before handing the panel to spotify
 #define RECORD_HOLD_MS 30000  // silence before the record is forgotten: its colors stay through a flip
-#define VINYL_DB 6           // above the bars' floor before it counts as vinyl; hum wanders
 // While Spotify's cover and text light the panel, its current reaches the ADC: up to ~5 dB
 // at full brightness, 9-15 dB dimmed. Vinyl must be louder than that to take over, so the
 // panel can't swap back and forth on its own interference.
@@ -429,7 +467,7 @@ struct NowPlaying
 
 // how far above the bars' floor the turntable must be to count as vinyl; higher while the
 // Spotify view (or its slide out) lights the panel
-static int vinylThreshold() { return np.visible || np.leaving ? VINYL_OVER_SPOTIFY_DB : VINYL_DB; }
+static int vinylThreshold() { return np.visible || np.leaving ? VINYL_OVER_SPOTIFY_DB : AUDIO_DB; }
 
 // the record on the turntable, recognized by groove-id on tape
 struct Record
@@ -829,12 +867,21 @@ static void logIdle()
             sendLog("%lus vinyl off after %lus", millis() / 1000, (millis() - vinylSince) / 1000);
     }
 
+    static bool wasStandby = false;
+    if (standby != wasStandby)
+    {
+        wasStandby = standby;
+        sendLog(standby ? "%lus standby, above noise %+.1f dB" : "%lus awake, above noise %+.1f dB",
+                millis() / 1000, signalDb);
+    }
+
     static uint32_t lastBeat = -LOG_BEAT_MS;
     if (millis() - lastBeat > LOG_BEAT_MS)
     {
         lastBeat = millis();
-        sendLog("%lus alive, above noise %+.1f dB, WiFi %d dBm", millis() / 1000, signalDb,
-                WiFi.RSSI());
+        // the state again, in case a broadcast got lost
+        sendLog("%lus alive%s, above noise %+.1f dB, WiFi %d dBm", millis() / 1000, standby ? " in standby" : "",
+                signalDb, WiFi.RSSI());
     }
 
     static struct Spike
@@ -846,7 +893,7 @@ static void logIdle()
 
     int band = -1;
     float raw = 0.0f, filtered = -1e9f;
-    if (!booting() && millis() - lastVinyl > VINYL_HOLD_MS)
+    if (!bootNoise() && millis() - lastVinyl > VINYL_HOLD_MS)
         for (int b = 0; b < BANDS; b++)
         {
             if (bandsRaw[b] - bandNoise[b] > raw)
@@ -870,11 +917,13 @@ static void logIdle()
     }
     else if (spike.frames)
     {
-        sendLog("%lus spike: band %d (%d-%d Hz), %+.1f dB for %d frame%s, after filter %+.1f dB%s",
-                spike.since / 1000, spike.band, (int)(bandEdge[spike.band] * binHz),
-                (int)(bandEdge[spike.band + 1] * binHz), spike.raw, spike.frames,
-                spike.frames == 1 ? "" : "s", spike.filtered,
-                spike.filtered > 0.0f ? " -> SHOWN" : "");
+        // only what gets through the despiking could light a bar; the rest are single frames
+        // the median throws away, several a second
+        if (spike.filtered > 0.0f)
+            sendLog("%lus spike: band %d (%d-%d Hz), %+.1f dB for %d frame%s, after filter %+.1f dB%s",
+                    spike.since / 1000, spike.band, (int)(bandEdge[spike.band] * binHz),
+                    (int)(bandEdge[spike.band + 1] * binHz), spike.raw, spike.frames,
+                    spike.frames == 1 ? "" : "s", spike.filtered, standby ? ", in standby" : " -> SHOWN");
         spike = Spike();
     }
 }
@@ -1004,7 +1053,7 @@ static bool updateNowPlaying()
     updateClip();
     if (np.active && millis() - np.lastPacket > NP_TIMEOUT_MS) np.active = false;
 
-    if (signalDb > vinylThreshold()) lastVinyl = millis();
+    if (signalDb > vinylThreshold() && !bootNoise()) lastVinyl = millis();
 #ifdef IDLE_LOG
     logIdle();
 #endif
@@ -1237,6 +1286,8 @@ void setup()
         bandEdge[b] = min(bin, FFT_N / 2);
     }
     beginCalibration();
+    // the despiking starts from the noise floor: from 0 dB, the first frames read as loud audio
+    for (int b = 0; b < BANDS; b++) bandHistory[0][b] = bandHistory[1][b] = bandNoiseMeasured[b];
 
 #ifdef NOW_PLAYING
     beginNowPlaying();
@@ -1251,6 +1302,7 @@ void loop()
     sampleAudio();
     runFFT();
     if (updateCalibration()) return;
+    updateStandby();
 
     // with the needle up, "above noise" should sit around -NOISE_MARGIN_DB; if a band
     // twitches, recalibrate (hold DOWN)
