@@ -38,8 +38,15 @@
 #define NOISE_MARGIN_DB 6    // bars start this far above each band's measured noise
 #define CAL_HOLD_MS 2000     // hold the UP button this long to calibrate, with the needle up
 #define CAL_MS 15000         // calibration measures this long, keeping each band's loudest second
-#define DISPLAY_DB 30        // range the bars show, from the recent loudest band down
-#define MM_SIZE 32           // frames averaged for the scale and silence detection
+// The DMA library dims in hardware, by shortening how long the LEDs are on, so moderate
+// dimming keeps the color depth; very low values lose the darkest tones
+#define BRIGHTNESS 180  // 0-255
+#define DISPLAY_DB 20        // range the bars show, from the top of the scale down
+// The top of the scale jumps to any louder band at once and sinks this fast after it,
+// so the loudest moment just reaches the top and nothing is cut off there (an average
+// as the top did that to every peak above it, and the bass stuck to the ceiling)
+#define SCALE_DECAY_DB_S 6
+#define MM_SIZE 32           // frames averaged for silence detection
 #define ATTACK_MS 25         // how fast bars rise to a new level
 // boot animation, one phase after the other; the reels turn and the tape winds throughout
 #define BOOT_FADE_MS 3000                                      // the cassette fades in
@@ -145,8 +152,8 @@ struct MovingAverage
     }
 };
 
-MovingAverage peakAvg, signalAvg;
-float peakDb;    // recent loudest band, the top of the bar scale
+MovingAverage signalAvg;
+float peakDb = -1e9f;  // the top of the bar scale: the loudest band, sinking SCALE_DECAY_DB_S after it
 float signalDb;  // recent loudest band relative to its noise floor; > 0 means audio
 
 // RGB565 gives green one bit more than red and blue, so dark grays would light
@@ -398,7 +405,8 @@ static void runFFT()
     }
     bandLevelFrames++;
 
-    peakDb = peakAvg.add(maxDb);
+    // one frame lasts FFT_N / SAMPLE_HZ, ~26 ms
+    peakDb = max(maxDb, peakDb - SCALE_DECAY_DB_S * FFT_N / (float)SAMPLE_HZ);
     signalDb = signalAvg.add(maxSignal);
 }
 
@@ -419,9 +427,10 @@ static void fillGradient(uint16_t* rows, const uint8_t bottom[3], const uint8_t 
 // runs every frame, even pushed off the panel, so the bars keep moving
 static void drawBars(int dy)
 {
-    // Bars span DISPLAY_DB below the recent loudest band, but never reach into a band's
+    // Bars span DISPLAY_DB below the top of the scale, but never reach into a band's
     // noise: quiet passages show whatever rises above it, silence shows nothing.
     const float scale = (float)LED_ROWS / DISPLAY_DB;
+    const float top = peakDb;
     const uint16_t* rows = albumColors ? albumRow : colorRow;
     const uint16_t peak = albumColors ? albumPeak : colorPeak;
 
@@ -435,7 +444,7 @@ static void drawBars(int dy)
     for (int i = 0; i < LED_COLS; i++)
     {
         int b = i / BIN_WIDTH;
-        float bottom = max(peakDb - DISPLAY_DB, bandNoise[b]);
+        float bottom = max(top - DISPLAY_DB, bandNoise[b]);
         float target = constrain((bands[b] - bottom) * scale, 0.0f, (float)LED_ROWS);
         barLevel[i] += (target - barLevel[i]) * (target > barLevel[i] ? attack : release);
         int val = (int)lroundf(barLevel[i]);
@@ -1151,7 +1160,7 @@ void setup()
         Serial.println("matrix init failed");
         while (1) delay(10);
     }
-    matrix.setBrightness8(255);  // full, see the README on dimming
+    matrix.setBrightness8(BRIGHTNESS);
 
 #ifdef PANEL_TEST
     // a still image to check the panel mapping: white border, red top left, green top

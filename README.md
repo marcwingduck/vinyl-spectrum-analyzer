@@ -122,7 +122,8 @@ All settings are `#define`s at the top of [src/main.cpp](src/main.cpp).
 | `PEAK_FALLOFF_MS` | 500 | How long a peak dot hangs before sinking |
 | `bandNoiseDb` | measured | Default for each band's level with the needle up, until you calibrate with the UP button. Bars only show what rises above it, so silence stays dark and quiet passages still show. See below |
 | `NOISE_MARGIN_DB` | 6 | How far above its noise a band has to rise to show. Raise it if bars twitch with the needle up |
-| `DISPLAY_DB` | 30 | Range the bars cover below the recent loudest band. Lower it for livelier bars |
+| `DISPLAY_DB` | 20 | Range the bars cover below the top of the scale. Lower it for lower, livelier bars; raise it for fuller ones |
+| `SCALE_DECAY_DB_S` | 6 | The top of the scale follows the loudest band: up at once, down this fast. The loudest moment just reaches the top, and nothing is cut off there. Slower keeps the bars lower after a loud hit; faster brings them back up sooner. An average as the top (the old way) cut off every peak above it, so the bass bands stuck to the ceiling |
 | `SAMPLE_HZ` | 20000 | FFT sample rate, so the bars reach `SAMPLE_HZ / 2`. The ADC runs at `OVERSAMPLE` times this on its own timer (DMA), up to 83 kHz |
 | `OVERSAMPLE` | 4 | ADC samples averaged per FFT sample. Each doubling takes ~3 dB off random noise, not off hum |
 | `GAMMA` | 2.2 | Gamma correction for the artwork. Lower it if dark covers lose detail |
@@ -134,9 +135,9 @@ All settings are `#define`s at the top of [src/main.cpp](src/main.cpp).
 | `RECHECK_MS` | 120000 | Clip interval when no gap shows up, for sides without pauses |
 | `POP_MS` | 8000 | How long a recognized track stays before the bars return. Long names stretch it to `POP_MAX_MS` (15000) so they scroll through once |
 
-The colors are the `sage` and `lilac` RGB values in `setup()`. Everything runs at full brightness: dimming in software costs color depth (dark tones flicker and posterize), so tame the panel with a tinted film or smoked acrylic in front instead.
+The colors are the `sage` and `lilac` RGB values in `setup()`. `BRIGHTNESS` (0–255, 180 by default) dims the panel in hardware, by shortening how long the LEDs are on, so moderate dimming keeps the color depth; very low values lose the darkest tones. A tinted film or smoked acrylic in front works too.
 
-**Calibrating the noise floor:** the noise isn't even across bands. Mains hum puts 50 Hz and its harmonics well above the rest, so each band has its own floor. Calibrate wherever the board will run, since the hum depends on cables and power supply: lift the needle, then hold the **UP** button for 2 seconds. A progress bar runs for 15 seconds while each band is measured. The result is stored in flash and survives power cuts and firmware updates, unless an update changes the bands (`SAMPLE_HZ`, `FFT_N`, `BAND_LOW_HZ`), which needs a new calibration. Until the first calibration, the defaults in `bandNoiseDb` apply. With the needle up, `pio device monitor` should then show `above noise` around `-NOISE_MARGIN_DB`.
+**Calibrating the noise floor:** the noise isn't even across bands. Mains hum puts 50 Hz and its harmonics well above the rest, so each band has its own floor. Calibrate wherever the board will run, since the hum depends on cables and power supply: lift the needle, then hold the **UP** button for 2 seconds. A progress bar runs for 15 seconds while each band is measured. The result is stored in flash and survives power cuts and firmware updates, unless an update changes the bands (`SAMPLE_HZ`, `FFT_N`, `BAND_LOW_HZ`), which needs a new calibration. So does a change to the panel driver or its refresh settings: the panel's refresh couples into the ADC, and switching from Protomatter to the DMA library raised the idle level by about 9 dB, so the outer bands stayed lit until a recalibration. Until the first calibration, the defaults in `bandNoiseDb` apply. With the needle up, `pio device monitor` should then show `above noise` around `-NOISE_MARGIN_DB`.
 
 **Stray peaks while idle:** with WiFi set up, the board needs no cable for this. Uncomment `#define IDLE_LOG` at the top of [src/main.cpp](src/main.cpp), flash, and listen on any machine in the network (macOS `nc -ul` stops after the first line):
 
