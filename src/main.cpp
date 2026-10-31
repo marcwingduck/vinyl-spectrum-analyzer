@@ -38,6 +38,8 @@
 #define NOISE_MARGIN_DB 6    // bars start this far above each band's measured noise
 #define CAL_HOLD_MS 2000     // hold the UP button this long to calibrate, with the needle up
 #define CAL_MS 15000         // calibration measures this long, keeping each band's loudest second
+#define CAL_DB_PER_ROW 2     // calibration view: a band's dot moves a row per this many dB off the
+                             // average, or more where a band would leave the panel
 // Keep it at 255. The DMA library dims by pulsing the LEDs off within every row, and those
 // current pulses reach the ADC: at 180 the Spotify view added 9-15 dB to the bass and mid
 // bands, the board took that for vinyl and swapped to the bars every few seconds.
@@ -1076,9 +1078,10 @@ static bool updateNowPlaying()
 }
 #endif
 
-// Calibration: hold UP with the needle up. For CAL_MS the panel shows a progress bar
-// while each band's level is averaged per second; the loudest second becomes the band's
-// noise, stored in flash so it survives power cuts and firmware updates.
+// Calibration: hold UP with the needle up. For CAL_MS each band's level is averaged per
+// second, and the panel shows each band's noise so far above a progress bar. The loudest
+// second becomes the band's noise, stored in flash so it survives power cuts and firmware
+// updates.
 Preferences prefs;
 #define NOISE_LAYOUT (SAMPLE_HZ * 1000u + FFT_N + BAND_LOW_HZ)  // changes when the bands do
 int8_t bandNoiseMeasured[BANDS];
@@ -1159,9 +1162,30 @@ static bool updateCalibration()
         return false;
     }
 
-    // progress bar across the middle rows
+    // Each band's noise as measured so far, as a dot like a peak marker, between progress
+    // bars in the top and bottom rows: mid-height is the average of all bands, noisier bands
+    // sit higher, quieter ones lower, a row per CAL_DB_PER_ROW. That fixed scale keeps small
+    // differences small (stretched to min/max, every wobble filled the height); it only
+    // widens when the noisiest or quietest band would leave the panel.
+    float level[BANDS], average = 0.0f, high = -1e9f, low = 1e9f;
+    for (int b = 0; b < BANDS; b++)
+    {
+        level[b] = max(loudest[b], calFrames ? sum[b] / calFrames : loudest[b]);
+        average += level[b] / BANDS;
+        high = max(high, level[b]);
+        low = min(low, level[b]);
+    }
+    const int middle = LED_ROWS / 2, up = middle - 1, down = LED_ROWS - 2 - middle;  // rows free between the bars
+    float dbPerRow = max((float)CAL_DB_PER_ROW, max((high - average) / up, (average - low) / down));
     matrix.clearScreen();
-    matrix.fillRect(0, LED_ROWS / 2 - 1, LED_COLS * elapsed / CAL_MS + 1, 2, rgb(colorPeak));
+    for (int b = 0; b < BANDS; b++)
+    {
+        int y = middle - lroundf((level[b] - average) / dbPerRow);
+        for (int i = 0; i < BIN_WIDTH; i++) drawRgb(b * BIN_WIDTH + i, y, colorPeak);
+    }
+    int progress = LED_COLS * elapsed / CAL_MS + 1;
+    matrix.fillRect(0, 0, progress, 1, rgb(colorRow[0]));
+    matrix.fillRect(0, LED_ROWS - 1, progress, 1, rgb(colorRow[0]));
     show();
     return true;
 }
