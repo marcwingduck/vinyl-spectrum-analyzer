@@ -478,6 +478,7 @@ struct Record
     uint32_t exitFrame = 0;  // the last scroll-through started, pushing it all out; 0 until then
     bool spins = true;       // the record shows; the next track of the same one just slides in
     Track track;
+    Rgb label;  // the cover's second color, the bars' top; the accent without album colors
 } record;
 
 // when each step of a new record track's intro starts, from popSince; from spinAt the
@@ -556,6 +557,11 @@ static void receiveNowPlaying()
     {
         Track t;
         if (!readTrack(len, 6, t)) return;
+        const uint8_t* bars = packet + 4 + ART_SIZE * ART_SIZE * 3 + 3;
+        const Rgb barsBottom = {bars[0], bars[1], bars[2]}, barsTop = {bars[3], bars[4], bars[5]};
+        pendingAlbumColors = false;
+        for (int k = 0; k < 6; k++) pendingAlbumColors |= bars[k] != 0;
+
         bool newTrack = !record.known || strncmp(t.artist, record.track.artist, TEXT_MAX) ||
                         strncmp(t.title, record.track.title, TEXT_MAX);
         if (newTrack)
@@ -564,18 +570,16 @@ static void receiveNowPlaying()
             record.spins = !record.known || memcmp(t.art, record.track.art, sizeof(t.art));
             t.artistSince = t.titleSince = UINT32_MAX;  // no scrolling until they've slid in
             record.track = t;
+            record.label = pendingAlbumColors ? barsTop : t.accent;
             record.popSince = millis();
             record.namesIn = false;
             record.exitFrame = 0;
         }
         record.known = true;
 
-        const uint8_t* bars = packet + 4 + ART_SIZE * ART_SIZE * 3 + 3;
-        pendingAlbumColors = false;
-        for (int k = 0; k < 6; k++) pendingAlbumColors |= bars[k] != 0;
         if (pendingAlbumColors)
         {
-            fillGradient(pendingRow, {bars[0], bars[1], bars[2]}, {bars[3], bars[4], bars[5]});
+            fillGradient(pendingRow, barsBottom, barsTop);
             pendingPeak = t.accent;
         }
         // a recheck of the playing track changes nothing visible, so it applies at once
@@ -1005,7 +1009,7 @@ static bool drawPopIn()
     else if (t < pushAt)  // the record is pulled out of it to the right, over the bars, and turns
     {
         drawBars(0);  // they go on in the record's corners
-        drawRecord(lroundf(easeOut((t - pullAt) / (float)PULL_MS) * RECORD_X), track.accent,
+        drawRecord(lroundf(easeOut((t - pullAt) / (float)PULL_MS) * RECORD_X), record.label,
                    (t - pullAt) * RECORD_DEG_PER_MS);
         drawCover(track, 0, 0);  // over the record: it comes out from inside
     }
@@ -1022,7 +1026,7 @@ static bool drawPopIn()
         drawTitle(track, dx, 0, cycle);
         drawCover(track, 0, 0);
         // on top, only its round part: the cover shows around it
-        drawRecord(recordX, track.accent, (t - pullAt) * RECORD_DEG_PER_MS);
+        drawRecord(recordX, record.label, (t - pullAt) * RECORD_DEG_PER_MS);
     }
     show();
     return true;
