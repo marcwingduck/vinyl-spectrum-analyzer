@@ -31,7 +31,7 @@ void drawRecord(int x0, Rgb label, float turnDeg)
         for (int y = 0; y < RECORD_SIZE; y++)
             for (int x = 0; x < RECORD_SIZE; x++)
             {
-                float dx = x + 0.5f - RECORD_SIZE / 2, dy = y + 0.5f - RECORD_SIZE / 2;
+                float dx = x + 0.5f - RECORD_SIZE / 2.0f, dy = y + 0.5f - RECORD_SIZE / 2.0f;
                 dist[y][x] = hypotf(dx, dy);
                 angle[y][x] = atan2f(dy, dx) * RAD_TO_DEG;  // -90 is up, clockwise
             }
@@ -56,7 +56,7 @@ void drawRecord(int x0, Rgb label, float turnDeg)
                 c = {0, 0, 0};  // the spindle hole, dark rather than showing what's behind
             else if (d < 3.2f)
             {
-                float dx = x + 0.5f - RECORD_SIZE / 2, dy = y + 0.5f - RECORD_SIZE / 2;
+                float dx = x + 0.5f - RECORD_SIZE / 2.0f, dy = y + 0.5f - RECORD_SIZE / 2.0f;
                 c = printed(dx * turnCos - dy * turnSin, dx * turnSin + dy * turnCos) ? print : label;
             }
             else if (d > r - 1.05f)
@@ -65,6 +65,6 @@ void drawRecord(int x0, Rgb label, float turnDeg)
                 c = sheenColor;
             else
                 c = vinylColor;
-            drawRgb(x0 + x, y, c);
+            drawRgb(x0 + x, LED_ROWS - RECORD_SIZE + y, c);
         }
 }
