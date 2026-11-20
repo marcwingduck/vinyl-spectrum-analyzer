@@ -105,7 +105,7 @@ Datagram layout (version 4). Everything after byte 3 is only sent with `P` and `
 
 ### Pictures
 
-From a phone, open http://vinyl-matrix.local/ (Android phones that don't resolve `.local`: the board's IP, printed on the serial monitor at boot). Choose a picture from the phone, check how it will look on the panel's 32×16 LEDs, and send it. It fills the panel, cut from the middle; *Fit the whole picture* shows all of it with black bars. The phone scales the picture and posts the raw pixels to `/picture`, 1536 bytes of RGB888, row-major, so the board never decodes an image. The page is in [src/picture_page.h](src/picture_page.h) and can be added to the home screen, with an icon of the panel's bars and peaks drawn by [icons/render_icons.py](icons/render_icons.py). After changing that script, run it again: it rewrites the PNGs and `src/page_icons.h`, which the firmware serves them from.
+From a phone, open http://vinyl-matrix.local/ (Android phones that don't resolve `.local`: the board's IP, printed on the serial monitor at boot). Choose a picture from the phone, check how it will look on the panel's 32×16 LEDs, and send it. *Cover* fills the panel and cuts off what sticks out, *Contain* shows all of it with black bars, *Stretch* squeezes all of it to 2:1. With Cover, dragging the preview picks the part that shows; with Contain, it moves the picture between the bars. The phone scales the picture and posts the raw pixels to `/picture`, 1536 bytes of RGB888, row-major, so the board never decodes an image. The page is in [src/picture_page.h](src/picture_page.h) and can be added to the home screen, with an icon of the panel's bars and peaks drawn by [icons/render_icons.py](icons/render_icons.py). After changing that script, run it again: it rewrites the PNGs and `src/page_icons.h`, which the firmware serves them from.
 
 Over UDP, `I` puts a picture on the whole panel. Either way, a new picture slides in from the top, pushing out the previous one or Spotify's track, and the next Spotify track pushes it out at the bottom the same way. It stays until the board restarts or music starts: the turntable, or Spotify starting a track (paused and playing again counts; the 10 s repeats of the same track don't). A picture sent while a record plays is dropped, since vinyl always wins. While a picture is up, vinyl needs `VINYL_OVER_SPOTIFY_DB` to take over, as with the Spotify view. Send an all-black picture to blank the panel.
 
@@ -116,14 +116,18 @@ Over UDP, `I` puts a picture on the whole panel. Either way, a new picture slide
 | 5 | row count |
 | 6… | that many rows of 32 pixels, RGB888, row-major |
 
-A whole picture is 1536 bytes, which doesn't fit one WiFi datagram, and the board drops fragmented ones, so send it in parts of up to 12 rows. They gather until the part with the last row arrives, then the whole picture slides in. [screensavers/send_picture.py](screensavers/send_picture.py) sends any image file that way, scaled to 32×16 (needs Pillow):
+A whole picture is 1536 bytes, which doesn't fit one WiFi datagram, and the board drops fragmented ones, so send it in parts of up to 12 rows. They gather until the part with the last row arrives, then the whole picture slides in. From a terminal, for example, with any image file scaled to 32×16 (needs Pillow):
 
 ```sh
-python3 screensavers/send_picture.py screensavers/vi.png                 # to vinyl-matrix.local
-python3 screensavers/send_picture.py screensavers/vi.png 192.168.1.50    # or another address
+python3 - picture.png <<'EOF'
+import socket, sys
+from PIL import Image
+px = Image.open(sys.argv[1]).convert('RGB').resize((32, 16)).tobytes()
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+for first in (0, 8):
+    s.sendto(b'NP\x04I' + bytes([first, 8]) + px[first * 96:(first + 8) * 96], ('vinyl-matrix.local', 4210))
+EOF
 ```
-
-[screensavers/render_vi.py](screensavers/render_vi.py) draws the VI logos there, filled and as pink outlines.
 
 ## Recognizing the record (optional)
 

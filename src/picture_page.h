@@ -34,19 +34,31 @@ static const char PICTURE_PAGE[] = R"html(<!doctype html>
 <link rel="apple-touch-icon" href="/icon-192.png">
 <link rel="icon" href="/favicon.png" sizes="32x32">
 <style>
-:root { color-scheme: dark; --bg: #0d0d12; --card: #17171f; --line: #2a2a36; --text: #ececf1; --dim: #8b8b99; --accent: #ff2896; }
+:root { color-scheme: dark; --bg: #0d0d12; --card: #17171f; --line: #2a2a36; --text: #ececf1; --dim: #8b8b99; --accent: #e5b5ff; }  /* the bars' lilac */
 * { box-sizing: border-box; }
-body { margin: 0; background: var(--bg); color: var(--text); font: 16px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-       display: flex; justify-content: center; padding: max(24px, env(safe-area-inset-top)) 16px max(24px, env(safe-area-inset-bottom)); }
+body { margin: 0; min-height: 100vh; min-height: 100dvh; display: flex; justify-content: center; background: var(--bg); color: var(--text);
+       font: 16px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+       padding: max(24px, env(safe-area-inset-top)) 16px max(24px, env(safe-area-inset-bottom)); }
 main { width: 100%; max-width: 440px; display: flex; flex-direction: column; gap: 16px; }
 h1 { margin: 0; font-size: 20px; font-weight: 600; }
-canvas { display: block; width: 100%; aspect-ratio: 2 / 1; background: #000; border: 1px solid var(--line); border-radius: 12px; }
+/* everything below the title as one block, close together, a little above the middle of the
+   free space, where the eye puts the center; the rest of the height goes above and below it */
+.stage { flex: 1; display: flex; flex-direction: column; gap: 12px; }
+.stage::before { content: ""; flex: 2; }
+.stage::after { content: ""; flex: 3; }
+canvas { display: block; width: 100%; aspect-ratio: 2 / 1; background: #000; }
+canvas.drag { cursor: grab; touch-action: none; }
+.hint { margin: 0; font-size: 13px; color: var(--dim); text-align: center; }
+.hint[hidden] { display: block; visibility: hidden; }  /* keeps its space, so the preview doesn't jump */
 .pick { display: block; padding: 14px; text-align: center; background: var(--card); border: 1px dashed var(--line); border-radius: 12px;
         overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
-.pick input { display: none; }
-.check { display: flex; align-items: center; gap: 10px; color: var(--dim); }
-.check input { width: 20px; height: 20px; margin: 0; accent-color: var(--accent); }
-button { padding: 14px; font: inherit; font-weight: 600; color: #fff; background: var(--accent); border: 0; border-radius: 12px; }
+.pick input, .modes input { display: none; }
+/* how the picture meets the panel: three parts of one pill, the chosen one filled */
+.modes { display: grid; grid-template-columns: repeat(3, 1fr); padding: 4px; border: 1.5px solid var(--line); border-radius: 999px; }
+.modes label { padding: 10px 0; text-align: center; font-weight: 600; color: var(--dim); border-radius: 999px; cursor: pointer;
+               user-select: none; -webkit-tap-highlight-color: transparent; transition: background .15s, color .15s; }
+.modes label.on { color: var(--bg); background: var(--accent); }
+button { padding: 14px; font: inherit; font-weight: 600; color: var(--bg); background: var(--accent); border: 0; border-radius: 12px; }
 button:disabled { opacity: .35; }
 #status { min-height: 1.4em; margin: 0; color: var(--dim); text-align: center; }
 </style>
@@ -54,11 +66,18 @@ button:disabled { opacity: .35; }
 <body>
 <main>
 <h1>Vinyl Matrix</h1>
+<section class="stage">
+<label class="pick"><input type="file" id="file" accept="image/*"><span id="name">Choose image</span></label>
+<p class="hint" id="hint" hidden>Drag to adjust crop area</p>
 <canvas id="preview" width="640" height="320"></canvas>
-<label class="pick"><input type="file" id="file" accept="image/*"><span id="name">Choose a picture</span></label>
-<label class="check"><input type="checkbox" id="fit">Fit the whole picture, with black bars</label>
-<button id="send" disabled>Show on the panel</button>
+<div class="modes">
+<label class="on"><input type="radio" name="mode" value="cover" checked>Cover</label>
+<label><input type="radio" name="mode" value="contain">Contain</label>
+<label><input type="radio" name="mode" value="stretch">Stretch</label>
+</div>
 <p id="status"></p>
+<button id="send" disabled>Send</button>
+</section>
 </main>
 <script>
 const W = 32, H = 16, $ = id => document.getElementById(id);
@@ -88,18 +107,46 @@ function shrink(src, sx, sy, sw, sh, w, h) {
   return c;
 }
 
-// the panel's 32x16 pixels: the middle cut to 2:1, or with fit all of it, centered on black
+// cover: a 2:1 cut fills the panel; contain: all of it, on black; stretch: all of it, squeezed to 2:1
+let mode = 'cover';
+
+// Cover cuts a 2:1 part out of the picture, w x h of its pixels. It overflows
+// either across or down; spare is how far the cut can move that way, pan where it is (0 the
+// left or top edge, 1 the other, the middle to start with).
+let pan = .5;
+function cut() {
+  const sw = img.naturalWidth, sh = img.naturalHeight, w = Math.min(sw, sh * W / H), h = w * H / W;
+  return { w, h, across: sw - w >= sh - h, spare: Math.max(sw - w, sh - h) };
+}
+
+// Contain shrinks all of it to w x h LEDs, which leaves black LEDs either across or down: spare
+// of them, the picture at place along them (0 the left or top edge, 1 the other).
+let place = .5;
+function fitted() {
+  const sw = img.naturalWidth, sh = img.naturalHeight, s = Math.min(W / sw, H / sh);
+  const w = Math.max(1, Math.round(sw * s)), h = Math.max(1, Math.round(sh * s));
+  return { w, h, across: W - w >= H - h, spare: Math.max(W - w, H - h) };
+}
+
+// the panel's 32x16 pixels
 function render() {
   const sw = img.naturalWidth, sh = img.naturalHeight, out = canvas(W, H), ctx = out.getContext('2d');
   ctx.fillStyle = '#000';
   ctx.fillRect(0, 0, W, H);
-  if ($('fit').checked) {
-    const s = Math.min(W / sw, H / sh), w = Math.max(1, Math.round(sw * s)), h = Math.max(1, Math.round(sh * s));
-    ctx.drawImage(shrink(img, 0, 0, sw, sh, w, h), (W - w) >> 1, (H - h) >> 1);
+  const c = cut(), f = fitted();
+  if (mode == 'contain') {
+    const x = Math.round((W - f.w) * place), y = Math.round((H - f.h) * place);
+    ctx.drawImage(shrink(img, 0, 0, sw, sh, f.w, f.h), x, y);
+  } else if (mode == 'stretch') {
+    ctx.drawImage(shrink(img, 0, 0, sw, sh, W, H), 0, 0);
   } else {
-    const cw = Math.min(sw, sh * W / H), ch = cw * H / W;
-    ctx.drawImage(shrink(img, (sw - cw) / 2, (sh - ch) / 2, cw, ch, W, H), 0, 0);
+    ctx.drawImage(shrink(img, (sw - c.w) * pan, (sh - c.h) * pan, c.w, c.h, W, H), 0, 0);
   }
+  // a picture that isn't 2:1 leaves something to drag, unless it's stretched
+  const drag = mode != 'stretch' && (mode == 'contain' ? f : c).spare >= 1;
+  $('preview').classList.toggle('drag', drag);
+  $('hint').hidden = !drag;
+  $('hint').textContent = mode == 'contain' ? 'Drag to move' : 'Drag to adjust crop area';
   const rgba = ctx.getImageData(0, 0, W, H).data;
   pixels = new Uint8Array(W * H * 3);
   for (let i = 0; i < W * H; i++) pixels.set(rgba.subarray(i * 4, i * 4 + 3), i * 3);
@@ -147,25 +194,56 @@ $('file').onchange = async e => {
   next.onload = () => {
     URL.revokeObjectURL(url);
     img = next;
+    pan = place = .5;
     $('name').textContent = file.name;
     $('send').disabled = false;
     say('');
     render();
   };
-  next.onerror = () => { URL.revokeObjectURL(url); say("Can't read that picture."); };
+  next.onerror = () => { URL.revokeObjectURL(url); say('Not an image'); };
   next.src = url;
 };
 
-$('fit').onchange = () => img && render();
+// a class rather than :has(:checked), which older Android browsers don't know
+for (const radio of document.querySelectorAll('input[name=mode]'))
+  radio.onchange = () => {
+    mode = radio.value;
+    for (const r of document.querySelectorAll('input[name=mode]')) r.parentNode.classList.toggle('on', r.checked);
+    if (img) render();
+  };
+
+// Dragging the preview moves the picture with the finger: the cut over it, or with contain
+// the picture between its black LEDs. The preview is the cut's w picture pixels wide, or W LEDs.
+let last = null, queued = false;
+const preview = $('preview');
+preview.onpointerdown = e => {
+  if (!preview.classList.contains('drag')) return;
+  try { preview.setPointerCapture(e.pointerId); } catch (_) {}  // keeps the drag when the finger leaves it
+  last = e;
+};
+preview.onpointermove = e => {
+  if (!last) return;
+  const fit = mode == 'contain', l = fit ? fitted() : cut();
+  const moved = (l.across ? e.clientX - last.clientX : e.clientY - last.clientY) / preview.clientWidth;
+  last = e;
+  const clamp = v => Math.min(1, Math.max(0, v));
+  if (fit) place = clamp(place + moved * W / l.spare);
+  else pan = clamp(pan - moved * l.w / l.spare);
+  if (!queued) {  // once per screen refresh, however often the finger reports
+    queued = true;
+    requestAnimationFrame(() => { queued = false; render(); });
+  }
+};
+preview.onpointerup = preview.onpointercancel = () => last = null;
 
 $('send').onclick = async () => {
   $('send').disabled = true;
   say('Sending…');
   try {
     const r = await fetch('/picture', { method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: pixels });
-    say(r.ok ? 'On the panel.' : await r.text());
+    say(r.ok ? 'Sent' : await r.text());
   } catch (e) {
-    say("The panel doesn't answer. Same WiFi?");
+    say('Panel not reachable');
   }
   $('send').disabled = false;
 };

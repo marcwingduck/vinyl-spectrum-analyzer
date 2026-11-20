@@ -628,9 +628,9 @@ static void answerPicture()
     bool complete = uploadComplete;
     uploadComplete = false;  // a request without a raw body mustn't show the last one again
     if (!complete)
-        web.send(400, "text/plain", "That wasn't a 32x16 picture.");
+        web.send(400, "text/plain", "Not a 32x16 image");
     else if (millis() - lastVinyl <= VINYL_HOLD_MS)
-        web.send(409, "text/plain", "A record is playing, and vinyl wins.");
+        web.send(409, "text/plain", "Vinyl is playing");
     else
     {
         showPicture();
