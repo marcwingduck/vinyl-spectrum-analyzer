@@ -103,6 +103,28 @@ Datagram layout (version 4). Everything after byte 3 is only sent with `P` and `
 
 `V` has 6 more bytes before the strings: the bars' bottom and top color RGB at 775–780, all zero to keep sage and lilac. The strings start at 781.
 
+### Pictures
+
+From a phone, open http://vinyl-matrix.local/ (Android phones that don't resolve `.local`: the board's IP, printed on the serial monitor at boot). Choose a picture from the phone, check how it will look on the panel's 32×16 LEDs, and send it. It fills the panel, cut from the middle; *Fit the whole picture* shows all of it with black bars. The phone scales the picture and posts the raw pixels to `/picture`, 1536 bytes of RGB888, row-major, so the board never decodes an image. The page is in [src/picture_page.h](src/picture_page.h) and can be added to the home screen, with an icon of the panel's bars and peaks drawn by [icons/render_icons.py](icons/render_icons.py). After changing that script, run it again: it rewrites the PNGs and `src/page_icons.h`, which the firmware serves them from.
+
+Over UDP, `I` puts a picture on the whole panel. Either way, a new picture slides in from the top, pushing out the previous one or Spotify's track, and the next Spotify track pushes it out at the bottom the same way. It stays until the board restarts or music starts: the turntable, or Spotify starting a track (paused and playing again counts; the 10 s repeats of the same track don't). A picture sent while a record plays is dropped, since vinyl always wins. While a picture is up, vinyl needs `VINYL_OVER_SPOTIFY_DB` to take over, as with the Spotify view. Send an all-black picture to blank the panel.
+
+| Bytes | Content |
+|-------|---------|
+| 0–3 | `NP`, `4`, `I` |
+| 4 | first row, 0–15 |
+| 5 | row count |
+| 6… | that many rows of 32 pixels, RGB888, row-major |
+
+A whole picture is 1536 bytes, which doesn't fit one WiFi datagram, and the board drops fragmented ones, so send it in parts of up to 12 rows. They gather until the part with the last row arrives, then the whole picture slides in. [screensavers/send_picture.py](screensavers/send_picture.py) sends any image file that way, scaled to 32×16 (needs Pillow):
+
+```sh
+python3 screensavers/send_picture.py screensavers/vi.png                 # to vinyl-matrix.local
+python3 screensavers/send_picture.py screensavers/vi.png 192.168.1.50    # or another address
+```
+
+[screensavers/render_vi.py](screensavers/render_vi.py) draws the VI logos there, filled and as pink outlines.
+
 ## Recognizing the record (optional)
 
 With WiFi set up, the board can tell [groove-id](../groove-id) on the snapserver Pi what's on the turntable. It fingerprints a 10 s clip against the MP3s of the records in your Discogs collection. When a new track is recognized, its cover slides in from the top into its place on the left, over the bars, while they go on in the right, and rests there a moment. The record is pulled out of it to the right like out of a sleeve, over the bars, which go on in its corners, turning at 33⅓ rpm with its label in the cover's second color, the bars' top color (the accent when groove-id sends no bar colors). Then the artist and title come in from the right, pushing the record over the cover; they stop in their place, and the record glides on over the cover and off the panel (`SLEEVE_HOLD_MS`, `PULL_MS`, `SPIN_MS`, `MOVE_MS`). They stay at least `POP_MS` (8 s) and scroll through twice (`NAME_CYCLES`), the shorter one waiting at its start for the longer. The second time the bars rise back in from nothing (`BARS_IN_MS`), the names with a dark shadow to their right over them so they stay readable, and instead of coming back from the right they push the cover out to the left. The next track of the same record (the same cover) just slides in from the top, pushing the bars down, like a new Spotify track. The record is drawn live, so it fits every cover. The cover paints the bars in the album's colors as it comes down; they keep them, and the peaks its accent, until the turntable has been silent for `RECORD_HOLD_MS` (30 s), so a flip keeps them; the next side's first track then just slides in, as it's the same record.

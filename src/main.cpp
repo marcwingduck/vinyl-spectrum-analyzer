@@ -14,9 +14,12 @@
 #define NOW_PLAYING
 #include <ESPmDNS.h>
 #include <U8g2_for_Adafruit_GFX.h>
+#include <WebServer.h>
 #include <WiFi.h>
 #include <WiFiUdp.h>
 
+#include "page_icons.h"
+#include "picture_page.h"
 #include "secrets.h"
 #endif
 
@@ -397,6 +400,10 @@ static void draw()
 // at full brightness, 9-15 dB dimmed. Vinyl must be louder than that to take over, so the
 // panel can't swap back and forth on its own interference.
 #define VINYL_OVER_SPOTIFY_DB 20
+// and for this long after they go dark: the level's average holds their interference for
+// another MM_SIZE frames (~0.8 s). Without it, a whole-panel picture handing over to Spotify
+// read as vinyl, and the bars, lit by that, kept the noise going.
+#define LIT_SETTLE_MS 1000
 // A new track: the needle drops, or the level falls GAP_DB below the recent loud level
 // for GAP_MS (the groove still crackles, so not down to the floor) and comes back.
 // CLIP_DELAY_MS into the track the board asks for a clip; gapless sides every RECHECK_MS.
@@ -460,14 +467,41 @@ struct NowPlaying
         FROM_BLANK,
         FROM_CASSETTE,
         FROM_TRACK,
-        FROM_TITLE  // same album: only the title changes
+        FROM_TITLE,  // same album: only the title changes
+        FROM_PICTURE
     } slideFrom;
     Track track, previous;  // previous is only drawn while it slides out
 } np;
 
+// A picture from the phone's page or over UDP fills the panel until music starts: the
+// turntable, or Spotify starting a track. Not kept over a restart. A new one slides in from
+// the top, pushing out the previous picture or Spotify's track, as a new track does.
+struct Picture
+{
+    bool shown = false;
+    bool drawn = false;  // last frame, so a track coming in can push it out
+    uint32_t slideSince = 0;
+    enum
+    {
+        FROM_BLANK,
+        FROM_PICTURE,
+        FROM_TRACK
+    } slideFrom;
+    Rgb px[LED_ROWS * LED_COLS];  // row-major
+    Rgb previous[LED_ROWS * LED_COLS];  // only drawn while it slides out
+    uint8_t incoming[LED_ROWS * LED_COLS * 3];  // RGB888, gathered until all rows are in
+} picture;
+
+uint32_t lastLit = -LIT_SETTLE_MS;  // the last frame the Spotify view or a picture was drawn
+
 // how far above the bars' floor the turntable must be to count as vinyl; higher while the
-// Spotify view (or its slide out) lights the panel
-static int vinylThreshold() { return np.visible || np.leaving ? VINYL_OVER_SPOTIFY_DB : AUDIO_DB; }
+// Spotify view (or its slide out) or a picture lights the panel, and until their
+// interference has left the level's average
+static int vinylThreshold()
+{
+    bool lit = np.visible || np.leaving || picture.shown || millis() - lastLit < LIT_SETTLE_MS;
+    return lit ? VINYL_OVER_SPOTIFY_DB : AUDIO_DB;
+}
 
 // the record on the turntable, recognized by groove-id on tape
 struct Record
@@ -539,12 +573,106 @@ static uint32_t scrollFrames(int width)
 // px a scroll has moved f frames after it started: it waits scrollHoldFrames, then steps
 static int scrollOffset(uint32_t f) { return f > scrollHoldFrames ? (f - scrollHoldFrames) / scrollFramesPerPx : 0; }
 
+// A whole picture is in picture.incoming: it slides in from the top, pushing out what's there.
+static void showPicture()
+{
+    if (picture.shown)
+    {
+        memcpy(picture.previous, picture.px, sizeof(picture.px));
+        picture.slideFrom = Picture::FROM_PICTURE;
+    }
+    else
+    {
+        picture.slideFrom = np.visible ? Picture::FROM_TRACK : Picture::FROM_BLANK;
+        Serial.println("picture");
+    }
+    const uint8_t* p = picture.incoming;
+    for (int i = 0; i < LED_ROWS * LED_COLS; i++, p += 3) picture.px[i] = {p[0], p[1], p[2]};
+    picture.shown = true;
+    picture.slideSince = millis();
+}
+
+// 'I': the first row and the row count, then that many rows of LED_COLS RGB888 pixels.
+// The whole panel (1536 bytes) doesn't fit one datagram, and lwIP here drops fragmented
+// ones, so a picture comes in parts, e.g. rows 0-7 and 8-15. It shows once the part with
+// the last row is in, so a half of the previous one can't slide in with it.
+static void receivePicture(int len)
+{
+    if (len < 6) return;
+    const int first = packet[4], count = packet[5];
+    if (count == 0 || first + count > LED_ROWS || len < 6 + count * LED_COLS * 3) return;
+    memcpy(picture.incoming + first * LED_COLS * 3, packet + 6, count * LED_COLS * 3);
+    if (first + count == LED_ROWS) showPicture();
+}
+
+// The phone's page (picture_page.h) posts a whole picture at once: over TCP it needn't fit
+// a datagram. Read in chunks, shown only once all of it has arrived.
+WebServer web(80);
+bool uploadComplete = false;
+
+static void readPictureBody()
+{
+    HTTPRaw& raw = web.raw();
+    if (raw.status == RAW_START)
+        uploadComplete = true;
+    else if (raw.status == RAW_WRITE && raw.totalSize <= sizeof(picture.incoming))
+        memcpy(picture.incoming + raw.totalSize - raw.currentSize, raw.buf, raw.currentSize);
+    else if (raw.status == RAW_END)
+        uploadComplete = uploadComplete && raw.totalSize == sizeof(picture.incoming);
+    else
+        uploadComplete = false;  // too long, or aborted
+}
+
+static void answerPicture()
+{
+    bool complete = uploadComplete;
+    uploadComplete = false;  // a request without a raw body mustn't show the last one again
+    if (!complete)
+        web.send(400, "text/plain", "That wasn't a 32x16 picture.");
+    else if (millis() - lastVinyl <= VINYL_HOLD_MS)
+        web.send(409, "text/plain", "A record is playing, and vinyl wins.");
+    else
+    {
+        showPicture();
+        web.send(200, "text/plain", "ok");
+    }
+}
+
+// the home screen icon and favicon (page_icons.h), cached a week: they only change with a flash
+static void serveIcon(const char* path, const uint8_t* png, size_t len)
+{
+    web.on(path, HTTP_GET, [png, len] {
+        web.sendHeader("Cache-Control", "max-age=604800");
+        web.send_P(200, "image/png", (const char*)png, len);
+    });
+}
+
+static void beginWeb()
+{
+    web.on("/", HTTP_GET, [] { web.send(200, "text/html; charset=utf-8", PICTURE_PAGE); });
+    web.on("/manifest.json", HTTP_GET, [] { web.send(200, "application/manifest+json", PICTURE_MANIFEST); });
+    serveIcon("/icon-192.png", ICON_192, sizeof(ICON_192));
+    serveIcon("/icon-512.png", ICON_512, sizeof(ICON_512));
+    serveIcon("/favicon.png", FAVICON, sizeof(FAVICON));
+    serveIcon("/favicon.ico", FAVICON, sizeof(FAVICON));  // asked for by browsers on their own
+    web.on("/picture", HTTP_POST, answerPicture, readPictureBody);
+    web.begin();
+}
+
+// a picture's pixels shifted down by dy rows; whatever leaves the panel is clipped
+static void drawPixels(const Rgb* px, int dy)
+{
+    for (int y = max(0, -dy); y < min(LED_ROWS, LED_ROWS - dy); y++)
+        for (int x = 0; x < LED_COLS; x++) drawRgb(x, y + dy, px[y * LED_COLS + x]);
+}
+
 // Packet: "NP" version cmd, then for cmd 'P' (spotify):
 // 16x16 RGB888 art (row-major), accent RGB, artist\0, title\0 (UTF-8)
 // cmd 'S' (or silence for NP_TIMEOUT_MS) ends the now playing view.
 // cmd 'V' (the record on the turntable, from groove-id) is 'P' with the bars' bottom
 // and top RGB after the accent, all zero to keep the bars' own colors. It comes with
 // every recognition; only a new track pops in.
+// cmd 'I' is a picture for the whole panel, see receivePicture().
 static void receiveNowPlaying()
 {
     int len = udp.parsePacket();
@@ -552,6 +680,12 @@ static void receiveNowPlaying()
     len = udp.read(packet, sizeof(packet));
 
     if (len < 4 || packet[0] != 'N' || packet[1] != 'P' || packet[2] != 4) return;
+
+    if (packet[3] == 'I')
+    {
+        receivePicture(len);
+        return;
+    }
 
     if (packet[3] == 'V')
     {
@@ -612,6 +746,8 @@ static void receiveNowPlaying()
     t.artistSince = albumChanged || !np.active ? frames : current.artistSince;
     t.titleSince = artistChanged || titleChanged || !np.active ? frames : current.titleSince;
     current = t;
+    // a track starting (or playing again) ends a picture; the 10 s repeats of one don't
+    if (artistChanged || titleChanged || !np.active) picture.shown = false;
 
     np.active = true;
     np.lastPacket = millis();
@@ -694,6 +830,7 @@ static void drawNowPlaying()
             int dy = slideRows(elapsed);
             if (np.slideFrom == NowPlaying::FROM_TRACK) drawTrack(np.previous, dy);
             if (np.slideFrom == NowPlaying::FROM_CASSETTE) drawCassette(bootElapsed(), dy);
+            if (np.slideFrom == NowPlaying::FROM_PICTURE) drawPixels(picture.px, dy);
             drawTrack(np.track, dy - LED_ROWS);
         }
     }
@@ -716,8 +853,9 @@ static void beginNowPlaying()
     WiFi.setAutoReconnect(true);
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
     udp.begin(NP_PORT);
+    beginWeb();
 
-    clip = (int16_t*)ps_malloc(CLIP_SAMPLES * sizeof(int16_t));
+    clip =(int16_t*)ps_malloc(CLIP_SAMPLES * sizeof(int16_t));
     if (clip)
         clipServer.begin();
     else
@@ -1040,6 +1178,7 @@ static bool updateNowPlaying()
     if (!mdnsStarted && WiFi.status() == WL_CONNECTED)
     {
         mdnsStarted = MDNS.begin(HOSTNAME);
+        if (mdnsStarted) MDNS.addService("http", "tcp", 80);
         Serial.printf("WiFi up, %s.local -> %s\n", HOSTNAME, WiFi.localIP().toString().c_str());
     }
 
@@ -1053,7 +1192,10 @@ static bool updateNowPlaying()
         udp.endPacket();
     }
 
+    // what the last frame showed, before a packet can change it
+    if (np.visible || np.leaving || picture.shown) lastLit = millis();
     receiveNowPlaying();
+    web.handleClient();  // only checks for a connection while nobody's using the page
     updateClip();
     if (np.active && millis() - np.lastPacket > NP_TIMEOUT_MS) np.active = false;
 
@@ -1067,26 +1209,47 @@ static bool updateNowPlaying()
     // a flip keeps the record and its colors; after longer silence the next one starts over,
     // in the bars' own colors and with its full intro
     if (millis() - lastVinyl > RECORD_HOLD_MS) record.known = albumColors = pendingColors = false;
-    bool visible = np.active && !booting() && !vinyl;
+    if (vinyl) picture.shown = false;  // vinyl always wins, a picture too
+    const bool pictureShown = picture.shown && !booting();
+    bool visible = np.active && !booting() && !vinyl && !pictureShown;
 
     // stopped, the track slides out at the bottom like it does for a new one; vinyl
-    // takes the panel straight away
-    if (np.visible && !visible && !vinyl)
+    // or a picture takes the panel straight away
+    if (np.visible && !visible && !vinyl && !pictureShown)
     {
         np.leaving = true;
         np.leaveSince = millis();
     }
-    if (visible || vinyl || millis() - np.leaveSince >= SLIDE_MS) np.leaving = false;
+    if (visible || vinyl || pictureShown || millis() - np.leaveSince >= SLIDE_MS) np.leaving = false;
 
-    // appearing, the track slides in from the top, pushing the cassette out at boot;
-    // if the tape is already on its way down, the track joins in at the same height
+    // appearing, the track slides in from the top, pushing the cassette out at boot, or a
+    // picture; if the tape is already on its way down, the track joins in at the same height
     if (visible && !np.visible)
     {
-        np.slideFrom = cassetteShown ? NowPlaying::FROM_CASSETTE : NowPlaying::FROM_BLANK;
+        np.slideFrom = cassetteShown   ? NowPlaying::FROM_CASSETTE
+                       : picture.drawn ? NowPlaying::FROM_PICTURE
+                                       : NowPlaying::FROM_BLANK;
         np.slideSince = cassetteShown ? bootStart + BOOT_MS : millis();
     }
     np.visible = visible;
+    picture.drawn = pictureShown;
 
+    if (pictureShown)
+    {
+        uint32_t elapsed = millis() - picture.slideSince;
+        matrix.clearScreen();
+        if (elapsed < SLIDE_MS)
+        {
+            int dy = slideRows(elapsed);
+            if (picture.slideFrom == Picture::FROM_PICTURE) drawPixels(picture.previous, dy);
+            if (picture.slideFrom == Picture::FROM_TRACK) drawTrack(np.track, dy);
+            drawPixels(picture.px, dy - LED_ROWS);
+        }
+        else
+            drawPixels(picture.px, 0);
+        show();
+        return true;
+    }
     if (visible) drawNowPlaying();
     if (np.leaving)
     {
