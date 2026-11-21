@@ -50,6 +50,39 @@ inline Rgb mix(Rgb a, Rgb b, float t)
             (uint8_t)lroundf(a.b + (b.b - a.b) * t)};
 }
 
+// A "/" band of light sweeping left to right, as over the boot cassette, measured along 2x + y.
+// How far a pixel blends toward white: none, the band's edge, its core.
+static const float GLINT_SHINE[] = {0.0f, 0.45f, 0.85f};
+#define GLINT_STEPS_PER_S 69  // the cassette's speed: across its shell in BOOT_GLINT_MS (1 s)
+inline int glintLevel(int x, int y, int band)
+{
+    int d = abs(2 * x + y - band);
+    return d < 2 ? 2 : d < 4 ? 1 : 0;
+}
+// where the band is t ms into its sweep over columns x0..x1, from just off their left to just
+// off their right; far off the panel once it's through. Same speed whatever the width.
+inline int glintBand(uint32_t t, int x0, int x1)
+{
+    const int from = 2 * x0 - 4, to = 2 * x1 + LED_ROWS - 1 + 4;
+    // 64 bits: in 32, a picture up for 17 hours would wrap around and shine again
+    int band = from + (int)((uint64_t)t * GLINT_STEPS_PER_S / 1000);
+    return band <= to ? band : -100;
+}
+// Like light on a glossy surface: bright pixels catch it fully, dark ones less, black not at all.
+// Blending everything toward white the same read as a white stripe wandering over dark photos.
+#define GLINT_DARK 0.75f  // how much less dark pixels catch: 1 in proportion to their brightness, 0 like bright ones
+#define GLINT_TINT 0.15f  // how much of a pixel's own color the light takes on: 0 is white; more and a
+                          // bright pixel, already close to its own light, barely shows the band
+// c with the band's light on it
+inline Rgb glinted(Rgb c, int x, int y, int band)
+{
+    int level = glintLevel(x, y, band);
+    uint8_t top = max(c.r, max(c.g, c.b));
+    if (!level || !top) return c;
+    Rgb light = mix({255, 255, 255}, scaled(c, 255.0f / top), GLINT_TINT);  // its color at full brightness
+    return mix(c, light, GLINT_SHINE[level] * powf(top / 255.0f, GLINT_DARK));
+}
+
 // 0..1 -> 0..1, fast start, settles gently
 inline float easeOut(float p)
 {

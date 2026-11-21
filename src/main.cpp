@@ -3,6 +3,8 @@
 #include <arduinoFFT.h>
 #include <esp_adc/adc_continuous.h>
 
+#include <atomic>
+
 #include "cassette.h"
 #include "panel.h"
 #include "vinyl.h"
@@ -111,6 +113,15 @@ uint32_t samplesUsed;  // FFT samples taken since the last print, to check SAMPL
 // one frame of DMA results, 4 bytes each
 uint8_t adcBuf[FFT_N * OVERSAMPLE * SOC_ADC_DIGI_RESULT_BYTES];
 adc_continuous_handle_t adc;
+// The driver's buffer holds two frames; when loop() falls further behind, samples are dropped
+// and the frames with the gap read as broadband noise. Counted for the log.
+std::atomic<uint32_t> adcOverflows{0};  // lock-free on the ESP32, so the interrupt can count
+
+static bool IRAM_ATTR onAdcOverflow(adc_continuous_handle_t, const adc_continuous_evt_data_t*, void*)
+{
+    adcOverflows.fetch_add(1, std::memory_order_relaxed);
+    return false;
+}
 
 #ifdef NOW_PLAYING
 // Song recognition: whoever connects to CLIP_PORT gets the next CLIP_S seconds of
@@ -234,6 +245,9 @@ static void beginAudio()
     config.format = ADC_DIGI_OUTPUT_FORMAT_TYPE2;
 
     ESP_ERROR_CHECK(adc_continuous_config(adc, &config));
+    adc_continuous_evt_cbs_t callbacks = {};
+    callbacks.on_pool_ovf = onAdcOverflow;
+    ESP_ERROR_CHECK(adc_continuous_register_event_callbacks(adc, &callbacks, nullptr));
     ESP_ERROR_CHECK(adc_continuous_start(adc));
 }
 
@@ -656,14 +670,16 @@ static void beginWeb()
     serveIcon("/favicon.png", FAVICON, sizeof(FAVICON));
     serveIcon("/favicon.ico", FAVICON, sizeof(FAVICON));  // asked for by browsers on their own
     web.on("/picture", HTTP_POST, answerPicture, readPictureBody);
+    web.enableDelay(false);  // it'd pause loop() 1 ms every frame while nobody uses the page
     web.begin();
 }
 
-// a picture's pixels shifted down by dy rows; whatever leaves the panel is clipped
-static void drawPixels(const Rgb* px, int dy)
+// a picture's pixels shifted down by dy rows; whatever leaves the panel is clipped. A glint
+// band (glintBand()) shines over it, as over the cassette.
+static void drawPixels(const Rgb* px, int dy, int glint = -100)
 {
     for (int y = max(0, -dy); y < min(LED_ROWS, LED_ROWS - dy); y++)
-        for (int x = 0; x < LED_COLS; x++) drawRgb(x, y + dy, px[y * LED_COLS + x]);
+        for (int x = 0; x < LED_COLS; x++) drawRgb(x, y + dy, glinted(px[y * LED_COLS + x], x, y, glint));
 }
 
 // Packet: "NP" version cmd, then for cmd 'P' (spotify):
@@ -785,25 +801,27 @@ static void drawTitle(const Track& t, int dx, int dy, uint32_t cycle = 0)
     drawMarquee(t.title, t.titleWidth, dx, TITLE_BASELINE + dy, rgb(255, 255, 255), t.titleSince, cycle);
 }
 
-static void drawCover(const Track& t, int x0, int dy)
+// with a glint band (glintBand()) shining over it, as over the cassette
+static void drawCover(const Track& t, int x0, int dy, int glint = -100)
 {
     for (int y = 0; y < ART_SIZE; y++)
-        for (int x = 0; x < ART_SIZE; x++) drawRgb(x0 + x, y + dy, t.art[y * ART_SIZE + x]);
+        for (int x = 0; x < ART_SIZE; x++)
+            drawRgb(x0 + x, y + dy, glinted(t.art[y * ART_SIZE + x], x0 + x, y + dy, glint));
 }
 
 // the gap and artwork go last so they cover text scrolling out to the left
-static void drawArt(const Track& t, int dy)
+static void drawArt(const Track& t, int dy, int glint = -100)
 {
     fillRect(ART_SIZE, dy, TEXT_X - ART_SIZE, LED_ROWS, 0);
-    drawCover(t, 0, dy);
+    drawCover(t, 0, dy, glint);
 }
 
 // draws a track shifted down by dy rows; whatever leaves the panel is clipped
-static void drawTrack(const Track& t, int dy)
+static void drawTrack(const Track& t, int dy, int glint = -100)
 {
     drawArtist(t, 0, dy);
     drawTitle(t, 0, dy);
-    drawArt(t, dy);
+    drawArt(t, dy, glint);
 }
 
 static void drawNowPlaying()
@@ -836,7 +854,10 @@ static void drawNowPlaying()
     }
     else
     {
-        drawTrack(np.track, 0);
+        // in place, light sweeps across a new cover once, as over the cassette;
+        // a new title from the same album keeps its cover as it was
+        int glint = np.slideFrom == NowPlaying::FROM_TITLE ? -100 : glintBand(elapsed - SLIDE_MS, 0, ART_SIZE - 1);
+        drawTrack(np.track, 0, glint);
     }
 
     show();
@@ -976,6 +997,19 @@ static void sendLog(const char* fmt, ...)
     udp.endPacket();
 }
 
+// the band furthest above its floor, as "band 3 (156-195 Hz) +4.2 dB"
+static const char* loudestBand()
+{
+    static char text[48];
+    const float binHz = (float)SAMPLE_HZ / FFT_N;
+    int loudest = 0;
+    for (int b = 1; b < BANDS; b++)
+        if (bands[b] - bandNoise[b] > bands[loudest] - bandNoise[loudest]) loudest = b;
+    snprintf(text, sizeof(text), "band %d (%d-%d Hz) %+.1f dB", loudest, (int)(bandEdge[loudest] * binHz),
+             (int)(bandEdge[loudest + 1] * binHz), bands[loudest] - bandNoise[loudest]);
+    return text;
+}
+
 // The needle is up, yet a band rises above its noise floor: reports each such burst
 // once it's over, with how loud it was before and after despiking.
 static void logIdle()
@@ -997,12 +1031,7 @@ static void logIdle()
         vinyl = !vinyl;
         if (vinyl)
         {
-            int loudest = 0;
-            for (int b = 1; b < BANDS; b++)
-                if (bands[b] - bandNoise[b] > bands[loudest] - bandNoise[loudest]) loudest = b;
-            sendLog("%lus vinyl on: band %d (%d-%d Hz) %+.1f dB above its floor, needs %+d", millis() / 1000,
-                    loudest, (int)(bandEdge[loudest] * binHz), (int)(bandEdge[loudest + 1] * binHz),
-                    bands[loudest] - bandNoise[loudest], vinylThreshold());
+            sendLog("%lus vinyl on: %s above its floor, needs %+d", millis() / 1000, loudestBand(), vinylThreshold());
             vinylSince = millis();
         }
         else
@@ -1017,13 +1046,25 @@ static void logIdle()
                 millis() / 1000, signalDb);
     }
 
+    // dropped audio, at most once a second: real sound and a board that can't keep up both
+    // light the bars, and this tells them apart
+    static uint32_t overflowsSeen = 0, lastOverflowLog = 0;
+    const uint32_t overflows = adcOverflows.load(std::memory_order_relaxed);  // once, as the interrupt adds on
+    if (overflows != overflowsSeen && millis() - lastOverflowLog >= 1000)
+    {
+        sendLog("%lus audio dropped: %lu buffer overflows", millis() / 1000, overflows - overflowsSeen);
+        overflowsSeen = overflows;
+        lastOverflowLog = millis();
+    }
+
     static uint32_t lastBeat = -LOG_BEAT_MS;
     if (millis() - lastBeat > LOG_BEAT_MS)
     {
         lastBeat = millis();
         // the state again, in case a broadcast got lost
-        sendLog("%lus alive%s, above noise %+.1f dB, WiFi %d dBm", millis() / 1000, standby ? " in standby" : "",
-                signalDb, WiFi.RSSI());
+        sendLog("%lus alive%s%s, above noise %+.1f dB, loudest %s, %lu overflows in all, WiFi %d dBm",
+                millis() / 1000, standby ? " in standby" : "", millis() - lastVinyl <= VINYL_HOLD_MS ? ", vinyl" : "",
+                signalDb, loudestBand(), overflows, WiFi.RSSI());
     }
 
     static struct Spike
@@ -1230,6 +1271,11 @@ static bool updateNowPlaying()
                        : picture.drawn ? NowPlaying::FROM_PICTURE
                                        : NowPlaying::FROM_BLANK;
         np.slideSince = cassetteShown ? bootStart + BOOT_MS : millis();
+        // the names wait their SCROLL_HOLD_MS from the slide's start, so they only scroll once
+        // the cover has come down and light has swept across it (SLIDE_MS + ~770 ms); a track
+        // that played on under a record or a picture would otherwise scroll right through
+        int32_t slideAgo = (int32_t)(millis() - np.slideSince);  // < 0: the tape is still there
+        np.track.artistSince = np.track.titleSince = frames - (int32_t)(slideAgo / FRAME_MS);
     }
     np.visible = visible;
     picture.drawn = pictureShown;
@@ -1245,8 +1291,8 @@ static bool updateNowPlaying()
             if (picture.slideFrom == Picture::FROM_TRACK) drawTrack(np.track, dy);
             drawPixels(picture.px, dy - LED_ROWS);
         }
-        else
-            drawPixels(picture.px, 0);
+        else  // in place, light sweeps across it once, as over the cassette
+            drawPixels(picture.px, 0, glintBand(elapsed - SLIDE_MS, 0, LED_COLS - 1));
         show();
         return true;
     }

@@ -34,15 +34,11 @@ static const Rgb cassettePalette[] = {
     {32, 32, 32},     // G screws
 };
 static const int cassetteColorCount = sizeof(cassettePalette) / sizeof(Rgb);
-static const float glintShine[] = {0.0f, 0.45f, 0.85f};  // blend toward white: none, edge, core
 static const int reelX[] = {10, 20}, reelY = 6;          // top left of the 2x2 reel hubs
 static const int loadX = 13, loadW = 6;                  // the D window between the hubs
 static const Rgb tapeColor = {180, 145, 72};             // amber; LEDs push warm tones red
 // full 8 bits per channel: through rgb()'s 5 bits the fade crept up in visible steps
-static Rgb cassetteColor(Rgb color, float level, float shine)
-{
-    return scaled(mix(color, {255, 255, 255}, shine), level);
-}
+static Rgb cassetteColor(Rgb color, float level) { return scaled(color, level); }
 
 // how much of pixel (x, y) a tape pack of radius r around (cx, cy) covers, 0..1;
 // the partly covered edge pixel lets the pack grow smoothly
@@ -67,10 +63,8 @@ void drawCassette(uint32_t elapsed, int dy)
     // turn in steps
     int step = elapsed / REEL_STEP_MS;
     float level = FADE_FROM + (1.0f - FADE_FROM) * min(elapsed, (uint32_t)BOOT_FADE_MS) / BOOT_FADE_MS;
-    Rgb colors[3][cassetteColorCount];
-    for (int s = 0; s < 3; s++)
-        for (int i = 0; i < cassetteColorCount; i++)
-            colors[s][i] = cassetteColor(cassettePalette[i], level, glintShine[s]);
+    Rgb colors[cassetteColorCount];
+    for (int i = 0; i < cassetteColorCount; i++) colors[i] = cassetteColor(cassettePalette[i], level);
 
     // tape winds from the left reel to the right; its length is the packs' area,
     // so one radius shrinks as the other grows. Empty, a pack just reaches the window
@@ -81,21 +75,16 @@ void drawCassette(uint32_t elapsed, int dy)
     float radius[2] = {sqrtf(rMax * rMax - (rMax * rMax - rMin * rMin) * wound),
                        sqrtf(rMin * rMin + (rMax * rMax - rMin * rMin) * wound)};
 
-    // once loaded, a "/" band of light runs across, measured along 2x + y
-    int glint = -100;
-    if (elapsed >= BOOT_FADE_MS && elapsed - BOOT_FADE_MS < BOOT_GLINT_MS)
-    {
-        const int from = 2 * 4 - 4, to = 2 * 27 + LED_ROWS - 1 + 4;  // just off the shell
-        glint = from + (to - from) * (int)(elapsed - BOOT_FADE_MS) / BOOT_GLINT_MS;
-    }
+    // once loaded, a band of light runs across the shell, columns 4-27, as over pictures and
+    // covers: the white edges and the label catch it fully, the gray shell less, the dark
+    // screws and window a little
+    int glint = elapsed >= BOOT_FADE_MS ? glintBand(elapsed - BOOT_FADE_MS, 4, 27) : -100;
 
     for (int y = 0; y < LED_ROWS; y++)
         for (int x = 0; x < LED_COLS; x++)
         {
             char c = cassette[y][x];
             if (c == '.') continue;
-            int d = abs(2 * x + y - glint), shine = d < 2 ? 2 : d < 4 ? 1
-                                                                      : 0;
             if (c == 'E')
             {
                 float cover = 0.0f;
@@ -104,11 +93,11 @@ void drawCassette(uint32_t elapsed, int dy)
                 {
                     // the pack's edge pixel blends into the window by how much it covers
                     Rgb window = mix(cassettePalette['E' - 'A'], tapeColor, cover);
-                    drawRgb(x, y + dy, cassetteColor(window, level, glintShine[shine]));
+                    drawRgb(x, y + dy, glinted(cassetteColor(window, level), x, y, glint));
                     continue;
                 }
             }
-            drawRgb(x, y + dy, colors[c == 'G' ? 0 : shine][c - 'A']);
+            drawRgb(x, y + dy, glinted(colors[c - 'A'], x, y, glint));
         }
 
     // one dark pixel circling each hub reads as rotation: top left, bottom left, ...

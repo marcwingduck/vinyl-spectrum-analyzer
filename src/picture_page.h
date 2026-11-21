@@ -71,8 +71,8 @@ button:disabled { opacity: .35; }
 <p class="hint" id="hint" hidden>Drag to adjust crop area</p>
 <canvas id="preview" width="640" height="320"></canvas>
 <div class="modes">
-<label class="on"><input type="radio" name="mode" value="cover" checked>Cover</label>
 <label><input type="radio" name="mode" value="contain">Contain</label>
+<label class="on"><input type="radio" name="mode" value="cover" checked>Cover</label>
 <label><input type="radio" name="mode" value="stretch">Stretch</label>
 </div>
 <p id="status"></p>
